@@ -1,85 +1,65 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Superserve Docs",
+  "theme": "maple",
+  "name": "Superserve",
   "colors": {
     "primary": "#105C60",
-    "light": "#105C60",
-    "dark": "#119CA3"
+    "light": "#119CA3",
+    "dark": "#0d474a"
+  },
+  "fonts": {
+    "heading": {
+      "family": "Funnel Display",
+      "weight": 600
+    },
+    "body": {
+      "family": "Inter"
+    }
+  },
+  "background": {
+    "color": {
+      "light": "#faf8f5",
+      "dark": "#1a1816"
+    },
+    "decoration": "gradient"
+  },
+  "styling": {
+    "codeblocks": {
+      "theme": {
+        "light": "github-light",
+        "dark": "vitesse-dark"
+      }
+    }
   },
   "favicon": "/images/Subtract.svg",
+  "logo": {
+    "light": "/logo/light.svg",
+    "dark": "/logo/dark.svg",
+    "href": "https://superserve.ai"
+  },
+  "appearance": {
+    "default": "light"
+  },
   "navigation": {
     "groups": [
       {
-        "group": "Getting started",
+        "group": "Getting Started",
         "pages": ["index", "quickstart"]
       },
       {
-        "group": "Core",
-        "pages": [
-          "runtime/tools",
-          "runtime/agents",
-          "runtime/serving",
-          "runtime/mcp"
-        ]
-      },
-      {
-        "group": "Frameworks",
-        "pages": [
-          "frameworks/build-from-scratch",
-          "frameworks/langchain",
-          "frameworks/pydantic"
-        ]
-      },
-      {
-        "group": "Native Tools",
-        "pages": ["tools/native/batch", "tools/native/sandbox"]
-      },
-      {
-        "group": "Examples",
-        "pages": []
+        "group": "Reference",
+        "pages": ["cli"]
       }
     ],
     "global": {
       "anchors": [
         {
           "anchor": "GitHub",
-          "href": "https://github.com/superserve-ai/agentic-ray",
-          "icon": "code"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://superserve.ai/blog",
-          "icon": "newspaper"
+          "href": "https://github.com/superserve-ai/superserve",
+          "icon": "github"
         }
       ]
     }
-  },
-  "logo": "/logo/superserve_logo.svg",
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hello@superserve.ai"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Get Started",
-      "href": "https://pypi.org/project/superserve/"
-    }
-  },
-  "contextual": {
-    "options": [
-      "copy",
-      "view",
-      "chatgpt",
-      "claude",
-      "perplexity",
-      "mcp",
-      "cursor",
-      "vscode"
-    ]
   },
   "footer": {
     "socials": {
@@ -88,14 +68,13 @@
       "linkedin": "https://www.linkedin.com/company/super-serve-ai/"
     }
   },
+  "contextual": {
+    "options": ["copy", "view"]
+  },
   "integrations": {
     "posthog": {
       "apiKey": "phc_gjpDKKKQJAnkxkqLrPGrAhoariKsaHNuTpI5rVhkYre",
       "apiHost": "https://us.i.posthog.com"
     }
-  },
-  "appearance": {
-    "strict": false,
-    "default": "system"
   }
 }

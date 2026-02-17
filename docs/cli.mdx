@@ -1,0 +1,243 @@
+---
+title: "CLI Reference"
+description: "Every superserve command"
+---
+
+## Authentication
+
+Authenticate with your Superserve account. Credentials are stored locally.
+
+<AccordionGroup>
+  <Accordion title="superserve login" icon="right-to-bracket">
+    ```bash
+    superserve login
+    ```
+
+    Opens your browser for authentication. Credentials are stored at `~/.superserve/credentials.json`.
+  </Accordion>
+
+  <Accordion title="superserve logout" icon="right-from-bracket">
+    ```bash
+    superserve logout
+    ```
+
+    Clears stored credentials.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Project setup
+
+Generate a `superserve.yaml` config in your project. This defines your agent name, start command, and secrets.
+
+<AccordionGroup>
+  <Accordion title="superserve init" icon="folder-plus">
+    ```bash
+    superserve init [--name NAME]
+    ```
+
+    Creates `superserve.yaml` in the current directory. Defaults the agent name to the directory name.
+
+    ### superserve.yaml
+
+    ```yaml
+    name: my-agent          # Required. Lowercase, alphanumeric, hyphens.
+    command: python main.py  # Required. Command to start your agent.
+
+    # Environment variables your agent needs to run
+    # secrets:
+    #   - ANTHROPIC_API_KEY
+
+    # Files and directories to exclude from upload
+    # ignore:
+    #   - .venv
+    #   - __pycache__
+    #   - .git
+    #   - node_modules
+    ```
+
+    If a `.env.example` file exists, secrets are auto-detected and added to the YAML.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Deployment
+
+Your code is uploaded and your dependencies are installed on the platform. Agents run inside gVisor-isolated sandbox containers built on a custom base image with Python pre-installed.
+
+<AccordionGroup>
+  <Accordion title="superserve deploy" icon="cloud-arrow-up">
+    ```bash
+    superserve deploy [--dir PATH] [--json]
+    ```
+
+    Deploy your agent. Re-deploying the same name updates the existing agent.
+
+    | Flag | Description |
+    |------|-------------|
+    | `--dir PATH` | Project directory (default: `.`) |
+    | `--json` | Output agent object as JSON |
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Secrets
+
+Set API keys and environment variables for your agent.
+
+<AccordionGroup>
+  <Accordion title="superserve secrets set" icon="lock">
+    ```bash
+    superserve secrets set AGENT KEY=VALUE [KEY=VALUE ...]
+    ```
+
+    Set one or more secrets. Existing secrets are preserved.
+  </Accordion>
+
+  <Accordion title="superserve secrets list" icon="key">
+    ```bash
+    superserve secrets list AGENT
+    ```
+
+    Shows key names only - values are never returned.
+  </Accordion>
+
+  <Accordion title="superserve secrets delete" icon="trash">
+    ```bash
+    superserve secrets delete AGENT KEY [--yes]
+    ```
+
+    Removes a secret. Use `--yes` to skip confirmation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Running agents
+
+Each run creates a session and provisions a sandbox with your code, secrets, and a persistent filesystem. Responses are streamed back in real time via SSE.
+
+<AccordionGroup>
+  <Accordion title="superserve run" icon="play" defaultOpen>
+    ```bash
+    superserve run AGENT [PROMPT] [--single] [--json]
+    ```
+
+    | Flag | Description |
+    |------|-------------|
+    | `--single` | Exit after one response |
+    | `--json` | Output raw SSE events as JSON |
+
+    ```bash
+    superserve run my-agent
+    You> What is the capital of France?
+    The capital of France is Paris.
+
+    Completed in 1.2s
+
+    You> And what's its population?
+    Paris has approximately 2.1 million people in the city proper.
+
+    Completed in 0.8s
+
+    You>
+    ```
+
+    **Single-turn:**
+
+    ```bash
+    superserve run my-agent "Hello" --single
+    ```
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Agent management
+
+List, inspect, and delete your deployed agents.
+
+<AccordionGroup>
+  <Accordion title="superserve agents list" icon="list">
+    ```bash
+    superserve agents list [--json]
+    ```
+
+    ```
+    NAME                      ID                                       CREATED
+    -------------------------------------------------------------------------------------
+    my-agent                  agt_7c9e66a1b2d3                         Feb 15 14:30
+    research-agent            agt_3f8a22c4e5f6                         Feb 10 09:15
+    ```
+  </Accordion>
+
+  <Accordion title="superserve agents get" icon="circle-info">
+    ```bash
+    superserve agents get NAME [--json]
+    ```
+
+    ```
+    ID:       agt_7c9e66a1b2d3
+    Name:     my-agent
+    Command:  python main.py
+    Created:  2025-02-15 14:30:00
+    Updated:  2025-02-16 10:45:22
+    ```
+  </Accordion>
+
+  <Accordion title="superserve agents delete" icon="trash">
+    ```bash
+    superserve agents delete NAME [--yes]
+    ```
+
+    Deletes an agent and all its data. Use `--yes` to skip confirmation.
+  </Accordion>
+</AccordionGroup>
+
+---
+
+## Sessions
+
+A session tracks a single conversation with your agent. Sessions are created automatically by `superserve run` and persist message history across turns.
+
+<AccordionGroup>
+  <Accordion title="superserve sessions list" icon="list">
+    ```bash
+    superserve sessions list [--agent NAME] [--status STATUS] [--json]
+    ```
+
+    ```
+    ID             AGENT                STATUS       MSGS   CREATED
+    ------------------------------------------------------------------------
+    a1b2c3d4e5f6   my-agent             active       12     Feb 16 10:30
+    f6e5d4c3b2a1   research-agent       completed    8      Feb 15 14:20
+    ```
+  </Accordion>
+
+  <Accordion title="superserve sessions get" icon="circle-info">
+    ```bash
+    superserve sessions get SESSION_ID [--json]
+    ```
+
+    ```
+    Session: ses_a1b2c3d4-e5f6-7890-abcd-ef1234567890
+      Agent:    my-agent (agt_7c9e66a1b2d3)
+      Status:   active
+      Messages: 12
+      Created:  2025-02-16 10:30:00
+    ```
+
+    Accepts short ID prefixes (e.g., `a1b2c3`).
+  </Accordion>
+
+  <Accordion title="superserve sessions end" icon="stop">
+    ```bash
+    superserve sessions end SESSION_ID
+    ```
+
+    Ends an active session.
+  </Accordion>
+</AccordionGroup>

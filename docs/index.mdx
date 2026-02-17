@@ -1,50 +1,50 @@
 ---
 title: "Introduction"
-description: "Distribute agentic workloads on Ray"
+description: "You build agents locally. Superserve deploys them to the cloud."
 ---
 
-## Why use Superserve?
-Superserve connects any agent framework (Langchain, Pydantic AI, and more) to Ray's distributed compute, 
-letting you run parallel tool calls across clusters, mix tools from different frameworks, and execute AI-generated code in isolated sandboxes.
+Superserve packages your agent code and deploys it to a sandboxed cloud container - one CLI command, no infrastructure config.
 
-<Card
-  title="Start here"
-  icon="rocket"
-  href="/quickstart"
-  horizontal
->
-  Follow our three step quickstart guide.
-</Card>
+```bash
+pip install superserve
+```
 
-## How it works
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="bolt" href="/quickstart">
+    Deploy your first agent in 5 minutes
+  </Card>
+  <Card title="CLI Reference" icon="terminal" href="/cli">
+    Every command, flag, and option
+  </Card>
+</CardGroup>
 
-<Columns cols={2}>
-  <Card
-    title="CLI"
-    icon="terminal"
-    href="https://pypi.org/project/superserve/"
-  >
-    Use command line to generate production-ready agents in seconds
+---
+
+## Why Superserve
+
+<CardGroup cols={2}>
+  <Card title="Sandboxed execution" icon="shield">
+    Every agent session runs in a gVisor-isolated container with its own compute, filesystem, and network.
   </Card>
-  <Card
-    title="Framework Agnostic"
-    icon="plug"
-    href="/frameworks/build-from-scratch"
-  >
-    Use tools from different frameworks together (Langchain, Pydantic AI)
+  <Card title="Persistent workspace" icon="hard-drive">
+    Storage that survives restarts and long inactivity. Agents pick up where they left off.
   </Card>
-    <Card
-    title="Batch tool"
-    icon="tasks"
-    href="/tools/native/batch"
-  >
-    Give LLMs a batch tool to distribute ANY tool calls across a cluster asynchronously
+  <Card title="Unlimited sessions" icon="infinity">
+    No session duration caps or CPU-time limits. Agents run as long as they need - hours or days.
   </Card>
-  <Card
-    title="Code Sandboxes"
-    icon="code"
-    href="/tools/native/sandbox"
-  >
-    Run AI-generated code safely in isolated sandbox environments
+  <Card title="Sub-second cold starts" icon="gauge-high">
+    Pre-provisioned containers mean your agent starts almost instantly.
   </Card>
-</Columns>
+  <Card title="Encrypted secrets" icon="lock">
+    API keys are encrypted and injected at runtime. Values are never exposed.
+  </Card>
+  <Card title="Real-time streaming" icon="bolt">
+    Stream tokens and tool calls as they happen. See what your agent is thinking and doing.
+  </Card>
+</CardGroup>
+
+---
+
+## <img src="/images/claude-agent-sdk.svg" alt="Claude" width="20" style={{display: "inline", verticalAlign: "middle", marginRight: "8px"}} />Built for Claude Agent SDK
+
+Write your agent with the [Claude Agent SDK](https://platform.claude.com/docs/en/agent-sdk/overview), run `superserve init` to generate your config, and deploy. Superserve handles sandboxing, persistence, and secrets.
