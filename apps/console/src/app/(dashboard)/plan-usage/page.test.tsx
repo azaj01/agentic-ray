@@ -303,7 +303,7 @@ describe("PlanUsagePage", () => {
     })
     renderPage()
 
-    expect(screen.queryByText("Pay-as-you-go • USD")).not.toBeInTheDocument()
+    expect(screen.queryByTestId("billing-statement")).not.toBeInTheDocument()
     expect(screen.queryByText("Current Balance")).not.toBeInTheDocument()
     expect(screen.queryByText("Billing is live")).not.toBeInTheDocument()
     expect(screen.queryByText("Tracked but not billed")).not.toBeInTheDocument()
@@ -388,7 +388,7 @@ describe("PlanUsagePage", () => {
     renderPage()
 
     expect(screen.queryByText("Free During Preview")).not.toBeInTheDocument()
-    expect(screen.queryByText("Pay-as-you-go • USD")).toBeInTheDocument()
+    expect(screen.getByTestId("billing-statement")).toBeInTheDocument()
     expect(useBillingUsage).toHaveBeenCalledWith(
       new Date("2026-06-01T00:00:00.000Z"),
       new Date("2026-07-01T00:00:00.000Z"),
@@ -451,7 +451,7 @@ describe("PlanUsagePage", () => {
         "Billing Period",
       ),
     ).toBeInTheDocument()
-    expect(screen.getByText("Pay-as-you-go • USD")).toBeInTheDocument()
+    expect(screen.getByTestId("billing-statement")).toBeInTheDocument()
     expect(
       within(screen.getByTestId("customer-billing-section")).getByText(
         "Credits remaining: $76.55",
@@ -829,7 +829,7 @@ describe("PlanUsagePage", () => {
     ).not.toBeInTheDocument()
     expect(screen.getByText("Usage Details")).toBeInTheDocument()
     expect(screen.queryByText(/Last updated:/i)).not.toBeInTheDocument()
-    expect(screen.getByText("Pay-as-you-go • USD")).toBeInTheDocument()
+    expect(screen.getByTestId("billing-statement")).toBeInTheDocument()
     expect(screen.queryByTestId("usage-cards-grid")).not.toBeInTheDocument()
     expect(screen.queryByTestId("sandboxes-card")).not.toBeInTheDocument()
     expect(screen.queryByTestId("compute-section")).not.toBeInTheDocument()
@@ -932,8 +932,14 @@ describe("PlanUsagePage", () => {
       renderPage()
     }
 
-    const creditsRemaining = () =>
-      screen.getAllByText(/Credits remaining/).map((node) => node.textContent)
+    // The plan panel's headline figure plus the billing section's summary line.
+    const creditsRemaining = () => [
+      within(screen.getByTestId("current-plan")).getByText("Credits remaining")
+        .nextElementSibling?.textContent,
+      ...screen
+        .getAllByText(/Credits remaining:/)
+        .map((node) => node.textContent),
+    ]
 
     it("shows Free with no included usage", () => {
       withSummary({
@@ -950,10 +956,8 @@ describe("PlanUsagePage", () => {
       })
       const plan = within(screen.getByTestId("current-plan"))
       expect(plan.getByText("Free")).toBeInTheDocument()
-      expect(plan.getByText("No subscription fee")).toBeInTheDocument()
-      expect(
-        plan.getByText("None. Usage is billed at standard rates."),
-      ).toBeInTheDocument()
+      expect(plan.getByText("Pay as you go")).toBeInTheDocument()
+      expect(plan.getByText("$76.55")).toBeInTheDocument()
     })
 
     it.each([
@@ -961,8 +965,8 @@ describe("PlanUsagePage", () => {
         "Pro Monthly",
         pro({}),
         "Pro Monthly",
-        "$1,200.00 / month",
-        "does not roll over",
+        "$1,200 / month",
+        "Includes $1,000 for Jun 1 – Jul 1. Unused credit expires.",
       ],
       [
         "Pro Annual with a pending allowance",
@@ -974,8 +978,8 @@ describe("PlanUsagePage", () => {
           included_usage: { ...included, status: "pending" },
         }),
         "Pro Annual",
-        "$12,000.00 / year",
-        "Being added to your account.",
+        "$12,000 / year",
+        "$1,000 for Jun 1 – Jul 1 is being added.",
       ],
       [
         "Pro awaiting its first payment",
@@ -984,18 +988,22 @@ describe("PlanUsagePage", () => {
           included_usage: { ...included, status: "not_issued" },
         }),
         "Awaiting payment",
-        "$1,200.00 / month",
-        "Not added for this period yet",
+        "$1,200 / month",
+        "$1,000 for Jun 1 – Jul 1 is added once payment is confirmed.",
       ],
     ])("shows %s", (_, plan, label, price, detail) => {
       withSummary({ plan })
       const card = within(screen.getByTestId("current-plan"))
       expect(card.getByText(label)).toBeInTheDocument()
       expect(card.getByText(price)).toBeInTheDocument()
-      expect(
-        card.getByText("$1,000.00 for Jun 1, 2026 - Jul 1, 2026"),
-      ).toBeInTheDocument()
-      expect(card.getByText(new RegExp(detail))).toBeInTheDocument()
+      expect(card.getByText(detail)).toBeInTheDocument()
+    })
+
+    it("does not present a missing plan as Free", () => {
+      withSummary({ plan: undefined })
+      const card = within(screen.getByTestId("current-plan"))
+      expect(card.getByText("Unavailable")).toBeInTheDocument()
+      expect(card.queryByText("Pay as you go")).not.toBeInTheDocument()
     })
 
     it("shows Stripe credit instead of the empty local balance", () => {
