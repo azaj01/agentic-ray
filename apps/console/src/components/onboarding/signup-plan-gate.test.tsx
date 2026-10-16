@@ -23,13 +23,11 @@ vi.mock("next/navigation", () => ({
 }))
 import { SignupPlanGate } from "./signup-plan-gate"
 
-function renderGate() {
+function renderGate(
+  client = new QueryClient({ defaultOptions: { queries: { retry: false } } }),
+) {
   render(
-    <QueryClientProvider
-      client={
-        new QueryClient({ defaultOptions: { queries: { retry: false } } })
-      }
-    >
+    <QueryClientProvider client={client}>
       <SignupPlanGate>
         <p>Console contents</p>
       </SignupPlanGate>
@@ -42,6 +40,20 @@ beforeEach(() => {
   mocks.context = { ready: true, teamKey: "use:team" }
 })
 describe("signup plan gate", () => {
+  it("keeps a server-verified YC team on the dashboard", () => {
+    mocks.context = { ready: true, teamKey: "use:yc-team" }
+    const client = new QueryClient()
+    client.setQueryData(["signup-plan", "use:yc-team"], {
+      userId: "owner",
+      state: "yc_claim",
+      offer: null,
+      teamKey: "use:yc-team",
+    })
+    renderGate(client)
+    expect(screen.getByText("Console contents")).toBeVisible()
+    expect(mocks.replace).not.toHaveBeenCalled()
+    expect(mocks.getPlan).not.toHaveBeenCalled()
+  })
   it("sends a team that still needs a plan to onboarding", async () => {
     mocks.getPlan.mockResolvedValue({
       userId: "owner",

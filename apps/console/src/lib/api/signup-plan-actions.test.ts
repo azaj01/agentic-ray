@@ -5,6 +5,8 @@ const mocks = vi.hoisted(() => ({
   team: vi.fn(),
   impersonation: vi.fn(),
   single: vi.fn(),
+  intent: vi.fn(),
+  billing: vi.fn(),
   from: vi.fn(),
   eq: vi.fn(),
   cookie: vi.fn(),
@@ -47,14 +49,130 @@ beforeEach(() => {
     data: { state: "selecting", offer_key: null },
     error: null,
   })
-  mocks.eq.mockReturnValue({ maybeSingle: mocks.single })
-  mocks.from.mockReturnValue({ select: () => ({ eq: mocks.eq }) })
+  mocks.intent.mockResolvedValue({ data: null, error: null })
+  mocks.billing.mockResolvedValue({ data: null, error: null })
+  mocks.from.mockImplementation((table: string) => ({
+    select: () => ({
+      eq: (...args: unknown[]) => {
+        mocks.eq(...args)
+        return {
+          maybeSingle:
+            table === "yc_claim_team_intent"
+              ? mocks.intent
+              : table === "billing_yc_operation"
+                ? mocks.billing
+                : mocks.single,
+        }
+      },
+    }),
+  }))
   mocks.cell.mockReturnValue({
     createAdminClient: () => ({ from: mocks.from }),
   })
 })
 
 describe("authoritative signup plan read", () => {
+  it("routes a team with an unreleased claim through YC without granting a plan", async () => {
+    mocks.intent.mockResolvedValue({
+      data: { claim_id: "claim", released_at: null },
+      error: null,
+    })
+    const result = await getSignupPlanAction("usw:west-team")
+    expect(result.state).toBe("yc_claim")
+    expect(result.offer).toBeNull()
+    expect(mocks.eq).toHaveBeenLastCalledWith("team_id", "west-team")
+  })
+  it("returns rejected claims to ordinary plan selection", async () => {
+    mocks.intent.mockResolvedValue({
+      data: { claim_id: "claim", released_at: "2026-10-16" },
+      error: null,
+    })
+    expect((await getSignupPlanAction()).state).toBe("selecting")
+  })
+  it.each(["intent", "billing"] as const)(
+    "routes a pending purchase through an authoritative YC %s",
+    async (authority) => {
+      mocks.single.mockResolvedValue({
+        data: { state: "pending", offer_key: "pro_monthly" },
+        error: null,
+      })
+      mocks[authority].mockResolvedValue({
+        data:
+          authority === "intent"
+            ? { claim_id: "claim", released_at: null }
+            : { id: "operation" },
+        error: null,
+      })
+      expect(await getSignupPlanAction()).toMatchObject({
+        state: "yc_claim",
+        offer: null,
+      })
+    },
+  )
+  it.each([null, { claim_id: "claim", released_at: "2026-10-16" }])(
+    "preserves pending purchase recovery without a live YC fence (%j)",
+    async (intent) => {
+      mocks.single.mockResolvedValue({
+        data: { state: "pending", offer_key: "pro_monthly" },
+        error: null,
+      })
+      mocks.intent.mockResolvedValue({ data: intent, error: null })
+      expect(await getSignupPlanAction()).toMatchObject({
+        state: "pending",
+        offer: "pro_monthly",
+      })
+    },
+  )
+  it("preserves an already committed ordinary purchase", async () => {
+    mocks.single.mockResolvedValue({
+      data: { state: "committed", offer_key: "pro_monthly" },
+      error: null,
+    })
+    mocks.intent.mockResolvedValue({
+      data: { claim_id: "claim", released_at: null },
+      error: null,
+    })
+    expect(await getSignupPlanAction()).toMatchObject({
+      state: "committed",
+      offer: "pro_monthly",
+    })
+    expect(mocks.intent).not.toHaveBeenCalled()
+    expect(mocks.billing).not.toHaveBeenCalled()
+  })
+  it.each(["active", "renewed"])(
+    "preserves dashboard access after revoking %s billing",
+    async (state) => {
+      mocks.intent.mockResolvedValue({
+        data: { claim_id: "claim", released_at: "2026-10-16" },
+        error: null,
+      })
+      mocks.billing.mockResolvedValue({
+        data: { id: "operation", state, revoked_at: "2026-10-16" },
+        error: null,
+      })
+      expect((await getSignupPlanAction()).state).toBe("yc_claim")
+    },
+  )
+  it("recognizes operator-managed YC billing without a public claim", async () => {
+    mocks.billing.mockResolvedValue({ data: { id: "operation" }, error: null })
+    expect((await getSignupPlanAction()).state).toBe("yc_claim")
+  })
+  it("does not infer ordinary onboarding from an unavailable billing read", async () => {
+    mocks.billing.mockResolvedValue({
+      data: null,
+      error: { code: "network_error" },
+    })
+    await expect(getSignupPlanAction()).rejects.toThrow("Unable to check")
+  })
+  it("blocks on uncertain claim reads but supports cells before the claim migration", async () => {
+    mocks.intent.mockResolvedValue({
+      data: null,
+      error: { code: "network_error" },
+    })
+    await expect(getSignupPlanAction()).rejects.toThrow("Unable to check")
+    mocks.intent.mockResolvedValue({ data: null, error: { code: "42P01" } })
+    expect((await getSignupPlanAction()).state).toBe("selecting")
+  })
   it("reads only the resolved home team's state and exposes no provider payload", async () => {
     const result = await getSignupPlanAction("usw:west-team")
     expect(mocks.cell).toHaveBeenCalledWith("usw")
