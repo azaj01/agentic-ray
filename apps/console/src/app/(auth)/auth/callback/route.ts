@@ -1,3 +1,4 @@
+import type { Session } from "@supabase/supabase-js"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
@@ -43,6 +44,13 @@ import { AUTH_EVENTS } from "@/lib/posthog/events"
 import { normalizeSignupEligibilitySnapshot } from "@/lib/slack/signup-eligibility"
 import { notifySlackOfNewUser } from "@/lib/slack/signup-notification"
 import { createServerClient } from "@/lib/supabase/server"
+import { ycReturnPath } from "@/lib/yc/return-path"
+import {
+  completeStaffGoogle,
+  STAFF_SESSION_COOKIE,
+  STAFF_PROOF_SECONDS,
+  staffCookieOptions,
+} from "@/lib/yc/staff-session"
 
 const TRUSTED_REDIRECT_PATTERN =
   /^https:\/\/([a-z0-9-]+\.)?superserve\.ai(\/.*)?$/
@@ -79,9 +87,11 @@ export async function GET(request: Request) {
   if (code || tokenHash) {
     const supabase = await createServerClient()
     let error = null
+    let exchangedSession: Session | null = null
     if (code) {
       const result = await supabase.auth.exchangeCodeForSession(code)
       error = result.error
+      exchangedSession = result.data?.session ?? null
     } else if (tokenHash && type) {
       const result = await supabase.auth.verifyOtp({
         token_hash: tokenHash,
@@ -133,6 +143,24 @@ export async function GET(request: Request) {
 
       let newSignup = false
       if (user) {
+        if (code && searchParams.has("staff_google_nonce")) {
+          const staffProof = await completeStaffGoogle(
+            exchangedSession,
+            searchParams.get("staff_google_nonce"),
+            user,
+          )
+          if (staffProof) {
+            const response = NextResponse.redirect(
+              buildRedirectUrl(origin, "/admin/yc"),
+            )
+            response.cookies.set(STAFF_SESSION_COOKIE, staffProof, {
+              ...staffCookieOptions,
+              maxAge: STAFF_PROOF_SECONDS,
+            })
+            response.cookies.delete(PLAN_OFFER_COOKIE)
+            return response
+          }
+        }
         const signupAttemptId =
           searchParams.get("signup_attempt_id") || undefined
         const provider = code
@@ -431,13 +459,16 @@ export async function GET(request: Request) {
           },
         )
 
+        const ycNext = ycReturnPath(next)
         if (
           !next.startsWith("/device") &&
           !next.startsWith("https://") &&
-          !/^\/onboarding\/plan\/?(?:\?|$)/.test(next)
+          !/^\/onboarding\/plan\/?(?:\?|$)/.test(next) &&
+          !ycNext
         ) {
           next = "/sandboxes"
         }
+        if (ycNext) next = ycNext
         if (
           next === "/sandboxes" &&
           (await cookies()).get("yc_claim_confirmation")

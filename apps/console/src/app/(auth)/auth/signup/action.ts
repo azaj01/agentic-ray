@@ -45,6 +45,7 @@ import { verifyRecaptcha } from "@/lib/recaptcha/verify"
 import { normalizeSignupEligibilitySnapshot } from "@/lib/slack/signup-eligibility"
 import { notifySlackOfNewUser } from "@/lib/slack/signup-notification"
 import { createAdminClient } from "@/lib/supabase/admin"
+import { ycReturnPath } from "@/lib/yc/return-path"
 
 const signUpSchema = z.object({
   email: z.string().email("Invalid email address."),
@@ -311,6 +312,7 @@ export const signUpWithEmail = async (
   captureResult?: SignupFingerprintResult,
   offer?: string,
   browserDiagnostics?: BrowserFingerprintDiagnostics,
+  ycNext?: string,
 ) => {
   const requestedOffer = normalizeRequestedOffer(offer)
   const parsed = signUpSchema.safeParse({ email, password, fullName })
@@ -444,6 +446,8 @@ export const signUpWithEmail = async (
     const appUrl =
       process.env.NEXT_PUBLIC_APP_URL || "https://console.superserve.ai"
     const callbackUrl = new URL("/auth/callback", appUrl)
+    const next = ycReturnPath(ycNext)
+    if (next) callbackUrl.searchParams.set("next", next)
     if (requestedOffer) callbackUrl.searchParams.set("offer", requestedOffer)
     const redirectTo = callbackUrl.toString()
     const signupStartedAt = Date.now()

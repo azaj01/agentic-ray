@@ -260,9 +260,12 @@ describe("SignUpPage", () => {
     expect(url.searchParams.get("offer")).toBe("yc_2026")
   })
 
-  it("calls signUpWithEmail and shows email-sent state on success", async () => {
+  it("submits diagnostics and the YC return path together before showing email-sent state", async () => {
     mockSignUpWithEmail.mockResolvedValue({ success: true })
-    mockSearchParams = new URLSearchParams("offer=pro_monthly")
+    mockSearchParams = new URLSearchParams({
+      offer: "pro_monthly",
+      next: "/yc/claim",
+    })
     render(<SignUpPage />)
 
     await user.type(
@@ -282,7 +285,7 @@ describe("SignUpPage", () => {
     })
     expect(screen.getByRole("link", { name: "Sign in" })).toHaveAttribute(
       "href",
-      "/auth/signin?offer=pro_monthly",
+      "/auth/signin?offer=pro_monthly&next=%2Fyc%2Fclaim",
     )
     expect(mockSignUpWithEmail).toHaveBeenCalledWith(
       "test@test.com",
@@ -293,6 +296,7 @@ describe("SignUpPage", () => {
       undefined,
       "pro_monthly",
       { schema_version: 1, events: [] },
+      "/yc/claim",
     )
   })
 
@@ -367,6 +371,7 @@ describe("SignUpPage", () => {
         undefined,
         undefined,
         { schema_version: 1, events: [] },
+        "/",
       )
     })
   })
@@ -766,6 +771,7 @@ describe("SignUpPage with reCAPTCHA configured", () => {
         undefined,
         undefined,
         { schema_version: 1, events: [] },
+        "/",
       )
     })
   })

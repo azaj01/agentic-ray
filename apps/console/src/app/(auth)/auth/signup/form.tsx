@@ -221,6 +221,7 @@ export default function SignUpContent() {
         capture,
         requestedOffer,
         fingerprintDiagnostics,
+        nextUrl,
       )
       if (!result.success) {
         posthog.capture(AUTH_EVENTS.SIGN_UP_FAILED, {
