@@ -279,7 +279,7 @@ describe("adminBillingRequest credentials", () => {
           body: {},
         }),
       ),
-    ).toBe("forbidden")
+    ).toBe("read_only_impersonation")
     expect(fetchMock).not.toHaveBeenCalled()
   })
 
@@ -380,5 +380,84 @@ describe("admin billing write routes", () => {
       ),
     ).toBe("invalid")
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+describe("adminBillingRequest error detail", () => {
+  const reader = () => signIn(staff(["platform:billing:read"]))
+  const failWith = async (status: number, body: unknown) => {
+    fetchMock.mockResolvedValue(Response.json(body, { status }))
+    const error = await adminBillingRequest({
+      region: "use",
+      path: "/internal/billing/x",
+      schema,
+    }).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(AdminBillingRequestError)
+    return error as AdminBillingRequestError
+  }
+
+  it("carries the backend message for conflicts and rejected requests", async () => {
+    reader()
+    const conflict = await failWith(409, {
+      error: { code: "plan_conflict", message: "a checkout is in progress" },
+    })
+    expect(conflict.kind).toBe("conflict")
+    expect(conflict.detail).toBe("a checkout is in progress")
+    expect(
+      (await failWith(400, { error: { code: "x", message: "bad date" } }))
+        .detail,
+    ).toBe("bad date")
+  })
+
+  it("never exposes bodies of other failures", async () => {
+    reader()
+    for (const status of [401, 403, 404, 500]) {
+      expect(
+        (await failWith(status, { error: { code: "x", message: "secret" } }))
+          .detail,
+      ).toBeUndefined()
+    }
+  })
+
+  it("caps length, strips control characters and ignores other shapes", async () => {
+    reader()
+    const long = await failWith(409, {
+      error: { code: "x", message: `a\nb${"c".repeat(500)}` },
+    })
+    expect(long.detail).toHaveLength(300)
+    expect(long.detail?.startsWith("a b")).toBe(true)
+    expect(long.detail?.endsWith("…")).toBe(true)
+    expect(
+      (
+        await failWith(409, {
+          error: { code: "x", message: "a\u202eb\u2028c\u0085d" },
+        })
+      ).detail,
+    ).toBe("a b c d")
+    const emoji = await failWith(409, {
+      error: { code: "x", message: "😀".repeat(400) },
+    })
+    expect([...(emoji.detail ?? "")]).toHaveLength(300)
+    expect(emoji.detail?.endsWith("😀…")).toBe(true)
+    const exact = "e".repeat(300)
+    expect(
+      (await failWith(409, { error: { code: "x", message: exact } })).detail,
+    ).toBe(exact)
+    expect(
+      (await failWith(422, { error: { code: "x", message: "bad terms" } }))
+        .detail,
+    ).toBe("bad terms")
+    expect(
+      (await failWith(409, { error: { code: "x", message: " \u0000\n " } }))
+        .detail,
+    ).toBeUndefined()
+    expect((await failWith(409, { message: "flat" })).detail).toBeUndefined()
+    fetchMock.mockResolvedValue(new Response("not json", { status: 409 }))
+    const text = await adminBillingRequest({
+      region: "use",
+      path: "/internal/billing/x",
+      schema,
+    }).catch((e: AdminBillingRequestError) => e)
+    expect((text as AdminBillingRequestError).detail).toBeUndefined()
   })
 })

@@ -1,5 +1,5 @@
 import "server-only"
-import type { z } from "zod"
+import { z } from "zod"
 
 import { getImpersonationTeamId } from "@/lib/admin/impersonation"
 import {
@@ -16,16 +16,46 @@ import { createServerClient } from "@/lib/supabase/server"
 
 export type AdminBillingErrorKind =
   | "forbidden"
+  | "read_only_impersonation"
   | "not_found"
   | "conflict"
   | "invalid"
   | "unavailable"
 
 export class AdminBillingRequestError extends Error {
-  constructor(public readonly kind: AdminBillingErrorKind) {
+  constructor(
+    public readonly kind: AdminBillingErrorKind,
+    public readonly detail?: string,
+  ) {
     super(kind)
     this.name = "AdminBillingRequestError"
   }
+}
+
+const MAX_DETAIL_LENGTH = 300
+
+const backendErrorSchema = z.object({
+  error: z.object({ message: z.string() }),
+})
+
+// Backend 400/409/422 messages reach staff verbatim, so only routes whose
+// handlers return fixed operator-facing messages may be called through here.
+async function errorDetail(response: Response): Promise<string | undefined> {
+  const parsed = backendErrorSchema.safeParse(
+    await response.json().catch(() => null),
+  )
+  if (!parsed.success) return undefined
+  const detail = parsed.data.error.message
+    .replace(
+      /[\u0000-\u001f\u007f-\u009f\u2028\u2029\u202a-\u202e\u2066-\u2069]+/g,
+      " ",
+    )
+    .trim()
+  if (!detail) return undefined
+  const chars = [...detail]
+  return chars.length > MAX_DETAIL_LENGTH
+    ? `${chars.slice(0, MAX_DETAIL_LENGTH - 1).join("")}…`
+    : detail
 }
 
 type Access = "read" | "write"
@@ -39,7 +69,7 @@ export async function requireAdminBilling(access: Access = "read") {
     access === "write" ? canWriteAdminBilling(user) : canReadAdminBilling(user)
   if (!user || !allowed) throw new AdminBillingRequestError("forbidden")
   if (access === "write" && (await getImpersonationTeamId(user)))
-    throw new AdminBillingRequestError("forbidden")
+    throw new AdminBillingRequestError("read_only_impersonation")
   return user
 }
 
@@ -59,6 +89,8 @@ const TEAM_BILLING = `/internal/teams/${UUID}/billing`
 
 type WriteMethod = "POST" | "PUT" | "DELETE"
 
+// Each write route must be an operator-group handler that re-checks
+// platform:billing:write and never puts raw internal errors in 400/409/422.
 const WRITE_ROUTES: [WriteMethod, string][] = [
   ["POST", `${TEAM_BILLING}/matching`],
   ["POST", `${TEAM_BILLING}/matching/revoke`],
@@ -126,8 +158,15 @@ export async function adminBillingRequest<T>({
   } catch {
     throw new AdminBillingRequestError("unavailable")
   }
-  if (!response.ok)
-    throw new AdminBillingRequestError(errorKind(response.status))
+  if (!response.ok) {
+    const kind = errorKind(response.status)
+    throw new AdminBillingRequestError(
+      kind,
+      kind === "conflict" || kind === "invalid"
+        ? await errorDetail(response)
+        : undefined,
+    )
+  }
   const parsed = schema.safeParse(await response.json().catch(() => null))
   if (!parsed.success) throw new AdminBillingRequestError("unavailable")
   return parsed.data
