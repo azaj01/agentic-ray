@@ -47,6 +47,7 @@ vi.stubGlobal("fetch", fetchSpy)
 // SANDBOX_API_URL is pre-stubbed in src/test/setup.ts; the route reads it at module load.
 
 import { getImpersonationContext } from "@/lib/admin/impersonation"
+import { previewPlanChange, schedulePlanChange } from "@/lib/api/plan-changes"
 import { publishPromotionIdentity } from "@/lib/api/promotion-identity"
 import {
   ensureAuthApiKeyForTeam,
@@ -57,6 +58,7 @@ import {
 } from "@/lib/api/proxy-auth"
 import { SignupRestrictedError } from "@/lib/auth/signup-restrictions"
 import { createServerClient } from "@/lib/supabase/server"
+import consentWire from "@/test/fixtures/billing-plan-change-wire.json"
 
 import { DELETE, GET, POST, PUT } from "./route"
 
@@ -129,6 +131,7 @@ describe("api proxy /api/[...path]", () => {
         body: JSON.stringify({
           expected_team: "use:team-east",
           offer: "pro_annual",
+          operation_id: "11111111-1111-4111-8111-111111111111",
           price_id: "attacker-price",
           success_url: "https://console.test/onboarding/plan/?billing=success",
           cancel_url: "https://console.test/onboarding/plan/?billing=cancel",
@@ -142,6 +145,7 @@ describe("api proxy /api/[...path]", () => {
     expect(url).toBe("https://api.test.superserve.ai/stripe/checkout-session")
     expect(JSON.parse(init.body)).toEqual({
       offer: "pro_annual",
+      operation_id: "11111111-1111-4111-8111-111111111111",
       success_url: "https://console.test/onboarding/plan/?billing=success",
       cancel_url: "https://console.test/onboarding/plan/?billing=cancel",
     })
@@ -212,6 +216,32 @@ describe("api proxy /api/[...path]", () => {
       ).status,
     ).toBe(403)
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("accepts dashboard Pro returns only for the pinned checkout team", async () => {
+    const path = ["stripe", "pro-checkout"]
+    fetchSpy.mockResolvedValue(
+      new Response(
+        JSON.stringify({ url: "https://checkout.stripe.com/session" }),
+        { status: 200 },
+      ),
+    )
+    for (const team of ["use:team-east", "use:other-team"]) {
+      const target = `https://console.test/billing/pro/?team=${encodeURIComponent(team)}`
+      const response = await POST(
+        req("POST", path, {
+          body: JSON.stringify({
+            expected_team: "use:team-east",
+            offer: "pro_monthly",
+            success_url: target,
+            cancel_url: target,
+          }),
+        }),
+        params(path),
+      )
+      expect(response.status).toBe(team === "use:team-east" ? 200 : 400)
+    }
+    expect(fetchSpy).toHaveBeenCalledOnce()
   })
 
   it("rejects arbitrary offers and cross-origin payment returns", async () => {
@@ -328,6 +358,187 @@ describe("api proxy /api/[...path]", () => {
       expect.objectContaining({ method: "GET" }),
     )
   })
+
+  it("forwards the plan, allowance and balance reads, GET only", async () => {
+    vi.mocked(publishPromotionIdentity).mockRejectedValue(
+      new Error("writer unavailable"),
+    )
+    fetchSpy.mockImplementation(() =>
+      Promise.resolve(
+        new Response("{}", {
+          status: 200,
+          headers: { "cache-control": "max-age=300" },
+        }),
+      ),
+    )
+    for (const path of [
+      ["billing", "plans", "public"],
+      ["billing", "plan"],
+      ["billing", "free-allowance"],
+      ["billing", "prepaid"],
+    ]) {
+      const res = await GET(req("GET", path), params(path))
+      expect(res.status).toBe(200)
+      expect(res.headers.get("cache-control")).toBe("private, no-store")
+      expect(fetchSpy).toHaveBeenLastCalledWith(
+        `https://api.test.superserve.ai/${path.join("/")}`,
+        expect.objectContaining({ method: "GET" }),
+      )
+      const write = await POST(req("POST", path), params(path))
+      expect(write.status).toBe(405)
+    }
+    for (const path of [
+      ["billing", "plans"],
+      ["billing", "plan", "x"],
+      ["billing", "prepaid", "recharge"],
+    ]) {
+      const res = await GET(req("GET", path), params(path))
+      expect(res.status).toBe(404)
+    }
+  })
+
+  it.each([
+    ["delayed", consentWire],
+    ["immediate", consentWire.immediate],
+  ])(
+    "round-trips a backend-captured %s preview into its accepted consent DTO",
+    async (_, wire) => {
+      vi.mocked(getAuthApiKeyAndTeamForUser).mockResolvedValue({
+        apiKey: "ss_live_test_key",
+        team: { teamId: wire.team_id, region: "use" },
+      } as never)
+      let upstreamWrites = 0
+      fetchSpy.mockImplementation(
+        async (input: string, init: RequestInit = {}) => {
+          if (input.startsWith("/api/")) {
+            const url = new URL(input, "https://console.test")
+            const path = url.pathname.split("/").filter(Boolean).slice(1)
+            const request = new NextRequest(url, {
+              ...init,
+              signal: init.signal ?? undefined,
+            })
+            return (init.method === "POST" ? POST : GET)(request, params(path))
+          }
+          const url = new URL(input)
+          expect(url.origin).toBe("https://api.test.superserve.ai")
+          if (url.pathname === "/billing/plan-change-preview") {
+            expect(url.search).toBe("?target_plan=free")
+            return new Response(JSON.stringify(wire.preview))
+          }
+          expect(url.pathname).toBe("/billing/plan-changes")
+          expect(init.method).toBe("POST")
+          expect(JSON.parse(init.body as string)).toEqual(wire.accepted_request)
+          upstreamWrites++
+          return new Response(JSON.stringify(wire.change))
+        },
+      )
+      const expectedTeam = `use:${wire.team_id}`
+      const preview = await previewPlanChange("free", expectedTeam)
+      expect(preview.preview_token).toBe(wire.preview.preview_token)
+      const result = await schedulePlanChange(
+        preview.target_plan_key,
+        expectedTeam,
+        wire.accepted_request.idempotency_key,
+        preview.preview_token!,
+        preview.pauses_running,
+        preview.timing === "end_of_billing_period"
+          ? preview.effective_at
+          : undefined,
+      )
+      expect(result).toEqual(wire.change)
+      expect(upstreamWrites).toBe(1)
+    },
+  )
+
+  it("forwards bound previews and writes on the actual customer paths", async () => {
+    fetchSpy.mockImplementation(() =>
+      Promise.resolve(new Response("{}", { status: 200 })),
+    )
+    const preview = ["billing", "plan-change-preview"]
+    const previewRequest = new NextRequest(
+      "https://console.test/api/billing/plan-change-preview?target_plan=free&expected_team=use%3Ateam-east",
+    )
+    expect((await GET(previewRequest, params(preview))).status).toBe(200)
+    expect(fetchSpy).toHaveBeenLastCalledWith(
+      "https://api.test.superserve.ai/billing/plan-change-preview?target_plan=free",
+      expect.objectContaining({ method: "GET" }),
+    )
+    expect((await POST(req("POST", preview), params(preview))).status).toBe(405)
+    const paths = [
+      ["billing", "plan-changes"],
+      [
+        "billing",
+        "plan-changes",
+        "34971786-dd50-492b-b934-306b63764c4b",
+        "undo",
+      ],
+    ]
+    for (const path of paths) {
+      const body = JSON.stringify({
+        expected_team: "use:team-east",
+        target_plan: "free",
+        expected_effective_at: "2026-11-01T00:00:00.123456789Z",
+        target: "discard-this-alias",
+        preview_token: "a".repeat(64),
+        confirm_pauses_running: true,
+        idempotency_key: "request-1",
+        ignored: true,
+      })
+      expect(
+        (await POST(req("POST", path, { body }), params(path))).status,
+      ).toBe(200)
+      expect(fetchSpy).toHaveBeenLastCalledWith(
+        `https://api.test.superserve.ai/${path.join("/")}`,
+        expect.objectContaining({
+          method: "POST",
+          body:
+            path.length === 2
+              ? JSON.stringify({
+                  target_plan: "free",
+                  idempotency_key: "request-1",
+                  preview_token: "a".repeat(64),
+                  expected_effective_at: "2026-11-01T00:00:00.123456789Z",
+                  confirm_pauses_running: true,
+                })
+              : "{}",
+        }),
+      )
+      expect((await GET(req("GET", path), params(path))).status).toBe(405)
+      expect((await DELETE(req("DELETE", path), params(path))).status).toBe(405)
+    }
+  })
+
+  it.each([undefined, "use:previous-team"])(
+    "rejects missing or stale team binding: %s",
+    async (expectedTeam) => {
+      const preview = ["billing", "plan-change-preview"]
+      const request = new NextRequest(
+        `https://console.test/api/billing/plan-change-preview?target_plan=free${expectedTeam ? `&expected_team=${encodeURIComponent(expectedTeam)}` : ""}`,
+      )
+      expect((await GET(request, params(preview))).status).toBe(409)
+      for (const path of [
+        ["billing", "plan-changes"],
+        [
+          "billing",
+          "plan-changes",
+          "34971786-dd50-492b-b934-306b63764c4b",
+          "undo",
+        ],
+      ]) {
+        expect(
+          (
+            await POST(
+              req("POST", path, {
+                body: JSON.stringify({ expected_team: expectedTeam }),
+              }),
+              params(path),
+            )
+          ).status,
+        ).toBe(409)
+      }
+      expect(fetchSpy).not.toHaveBeenCalled()
+    },
+  )
 
   it("forwards the authenticated billing pricing endpoint", async () => {
     vi.mocked(publishPromotionIdentity).mockRejectedValue(
@@ -781,6 +992,124 @@ describe("api proxy /api/[...path]", () => {
     expect(headers.get("authorization")).toBe("Bearer user-token")
   })
 
+  it("refuses an account awaiting Enterprise setup", async () => {
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: {
+        getUser: async () => ({
+          data: {
+            user: { id: "u1", app_metadata: { signup_review: "pending" } },
+          },
+        }),
+      },
+    } as never)
+    const res = await GET(req("GET", ["sandboxes"]), params(["sandboxes"]))
+    expect(res.status).toBe(403)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("forwards CLI authorisation for an unmarked account", async () => {
+    fetchSpy.mockResolvedValue(new Response("{}", { status: 200 }))
+    const getUser = vi.fn(async () => ({
+      data: { user: { id: "u1", app_metadata: {} } },
+      error: null,
+    }))
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: { getUser },
+    } as never)
+    await POST(
+      req("POST", ["v1", "auth", "device-authorize"], {
+        headers: {
+          authorization: "Bearer user-token",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }),
+      params(["v1", "auth", "device-authorize"]),
+    )
+    expect(getUser).toHaveBeenCalledWith("user-token")
+    expect(fetchSpy).toHaveBeenCalled()
+  })
+
+  it("refuses a CLI authorisation for an account awaiting Enterprise setup", async () => {
+    const getUser = vi.fn(async () => ({
+      data: { user: { id: "u1", app_metadata: { signup_review: "pending" } } },
+      error: null,
+    }))
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: { getUser },
+    } as never)
+    const res = await POST(
+      req("POST", ["v1", "auth", "device-authorize"], {
+        headers: {
+          authorization: "Bearer user-token",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }),
+      params(["v1", "auth", "device-authorize"]),
+    )
+    expect(getUser).toHaveBeenCalledWith("user-token")
+    expect(res.status).toBe(403)
+    await expect(res.json()).resolves.toHaveProperty("detail")
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("rejects an explicitly invalid CLI bearer without forwarding it", async () => {
+    fetchSpy.mockResolvedValue(new Response("{}", { status: 401 }))
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: {
+        getUser: async () => ({
+          data: { user: null },
+          error: { status: 401, code: "bad_jwt", message: "bad jwt" },
+        }),
+      },
+    } as never)
+    const res = await POST(
+      req("POST", ["v1", "auth", "device-authorize"], {
+        headers: {
+          authorization: "Bearer stale-token",
+          "content-type": "application/json",
+        },
+        body: "{}",
+      }),
+      params(["v1", "auth", "device-authorize"]),
+    )
+    expect(fetchSpy).not.toHaveBeenCalled()
+    expect(res.status).toBe(401)
+  })
+
+  it.each([429, 503, "throw", "missing_user"])(
+    "does not authorize a CLI bearer when Auth lookup fails with %s",
+    async (failure) => {
+      const getUser = vi.fn(async () => {
+        if (failure === "throw") throw new Error("lookup timed out")
+        return {
+          data: { user: null },
+          error:
+            typeof failure === "number"
+              ? { status: failure, message: "unavailable" }
+              : null,
+        }
+      })
+      vi.mocked(createServerClient).mockResolvedValue({
+        auth: { getUser },
+      } as never)
+      const res = await POST(
+        req("POST", ["v1", "auth", "device-authorize"], {
+          headers: {
+            authorization: "Bearer user-token",
+            "content-type": "application/json",
+          },
+          body: "{}",
+        }),
+        params(["v1", "auth", "device-authorize"]),
+      )
+      expect(res.status).toBe(503)
+      expect(res.headers.get("retry-after")).toBe("5")
+      expect(fetchSpy).not.toHaveBeenCalled()
+    },
+  )
+
   it("strips disallowed client-supplied headers (cookie, x-api-key)", async () => {
     fetchSpy.mockResolvedValue(new Response("[]", { status: 200 }))
     await GET(
@@ -884,5 +1213,176 @@ describe("api proxy /api/[...path]", () => {
     )
 
     expect((await res.json()).access_token).toBeUndefined()
+  })
+})
+
+describe("api proxy prepaid credit", () => {
+  beforeEach(() => {
+    fetchSpy.mockReset()
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: {
+        getUser: vi
+          .fn()
+          .mockResolvedValue({ data: { user: { id: "user-1" } } }),
+      },
+    } as never)
+    vi.mocked(getImpersonationContext).mockResolvedValue(null)
+  })
+
+  it("forwards only the purchase fields for the active team", async () => {
+    fetchSpy.mockResolvedValue(
+      new Response(JSON.stringify({ url: "https://checkout.stripe.com/s" }), {
+        status: 200,
+      }),
+    )
+    const path = ["billing", "prepaid", "checkout"]
+    const res = await POST(
+      req("POST", path, {
+        body: JSON.stringify({
+          expected_team: "use:team-east",
+          operation_id: "e2f2a080-167c-4cb0-8fb1-093be9e7720a",
+          amount_cents: 2500,
+          success_url: "https://console.test/plan-usage/buy-credit/",
+          cancel_url: "https://console.test/plan-usage/buy-credit/",
+          customer: "cus_attacker",
+        }),
+      }),
+      params(path),
+    )
+    expect(res.status).toBe(200)
+    const [url, init] = fetchSpy.mock.calls[0]
+    expect(url).toBe("https://api.test.superserve.ai/billing/prepaid/checkout")
+    expect(JSON.parse(init.body)).toEqual({
+      operation_id: "e2f2a080-167c-4cb0-8fb1-093be9e7720a",
+      amount_cents: 2500,
+      success_url: "https://console.test/plan-usage/buy-credit/",
+      cancel_url: "https://console.test/plan-usage/buy-credit/",
+    })
+    expect(res.headers.get("cache-control")).toBe("private, no-store")
+  })
+
+  it.each([
+    ["checkout", POST],
+    ["auto-recharge", PUT],
+  ] as const)(
+    "normalizes rewritten %s body headers",
+    async (suffix, handler) => {
+      fetchSpy.mockResolvedValue(new Response("{}", { status: 200 }))
+      const path = ["billing", "prepaid", suffix]
+      const body = JSON.stringify({
+        expected_team: "use:team-east",
+        amount_cents: 500,
+        enabled: false,
+        success_url:
+          "https://console.test/plan-usage/buy-credit?purchase=success",
+        cancel_url:
+          "https://console.test/plan-usage/buy-credit/?purchase=cancel",
+      })
+      const res = await handler(
+        req(suffix === "checkout" ? "POST" : "PUT", path, {
+          body,
+          headers: {
+            "content-length": String(Buffer.byteLength(body)),
+            "content-type": "text/plain",
+          },
+        }),
+        params(path),
+      )
+      expect(res.status).toBe(200)
+      const init = fetchSpy.mock.calls[0][1]
+      expect(init.headers.has("content-length")).toBe(false)
+      expect(init.headers.get("content-type")).toBe("application/json")
+      expect(JSON.parse(init.body)).not.toHaveProperty("expected_team")
+      expect(init.body.length).toBeLessThan(body.length)
+    },
+  )
+
+  it.each([
+    [
+      "https://other.test/plan-usage/buy-credit",
+      "https://console.test/plan-usage/buy-credit",
+    ],
+    [
+      "https://console.test/plan-usage/buy-credit",
+      "https://other.test/plan-usage/buy-credit",
+    ],
+    [
+      "https://console.test/plan-usage",
+      "https://console.test/plan-usage/buy-credit",
+    ],
+    [
+      "https://console.test/plan-usage/buy-credit",
+      "https://console.test/onboarding/plan",
+    ],
+    ["invalid", "https://console.test/plan-usage/buy-credit"],
+    [undefined, "https://console.test/plan-usage/buy-credit"],
+    ["https://console.test/plan-usage/buy-credit", undefined],
+  ])(
+    "rejects unowned prepaid payment returns %s / %s",
+    async (success_url, cancel_url) => {
+      const path = ["billing", "prepaid", "checkout"]
+      const res = await POST(
+        req("POST", path, {
+          body: JSON.stringify({
+            expected_team: "use:team-east",
+            amount_cents: 500,
+            success_url,
+            cancel_url,
+          }),
+        }),
+        params(path),
+      )
+      expect(res.status).toBe(400)
+      expect(fetchSpy).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
+    ["billing/prepaid/checkout", "POST"],
+    ["billing/prepaid/auto-recharge", "PUT"],
+  ])("rejects a stale team's %s request before dispatch", async (p, method) => {
+    const path = p.split("/")
+    const handler = method === "PUT" ? PUT : POST
+    const res = await handler(
+      req(method, path, {
+        body: JSON.stringify({ expected_team: "usw:old-team", enabled: false }),
+      }),
+      params(path),
+    )
+    expect(res.status).toBe(409)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("allows each prepaid path only with its own method", async () => {
+    for (const [p, method, handler] of [
+      ["billing/prepaid", "POST", POST],
+      ["billing/prepaid/checkout", "GET", GET],
+      ["billing/prepaid/auto-recharge", "POST", POST],
+      ["billing/prepaid/auto-recharge", "DELETE", DELETE],
+    ] as const) {
+      const path = p.split("/")
+      const res = await handler(req(method, path), params(path))
+      expect(res.status).toBe(405)
+    }
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
+  it("does not allow prepaid writes during impersonation", async () => {
+    vi.mocked(getImpersonationContext).mockResolvedValue({
+      teamId: "team-west",
+      region: "usw",
+    } as never)
+    const path = ["billing", "prepaid", "auto-recharge"]
+    const res = await PUT(
+      req("PUT", path, {
+        body: JSON.stringify({
+          expected_team: "usw:team-west",
+          enabled: false,
+        }),
+      }),
+      params(path),
+    )
+    expect(res.status).toBe(403)
+    expect(fetchSpy).not.toHaveBeenCalled()
   })
 })

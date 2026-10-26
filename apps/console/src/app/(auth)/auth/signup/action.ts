@@ -11,17 +11,30 @@ import { createPromotionSignupAttempt } from "@/lib/api/promotion-device-evidenc
 import { publishOriginalSignupEvidence } from "@/lib/api/promotion-publication"
 import { isGenericAuthSignupFailure } from "@/lib/auth/errors"
 import { issueGoogleSignupProof } from "@/lib/auth/google-signup-proof"
-import { normalizeRequestedOffer } from "@/lib/auth/requested-offer"
+import { normalizeSignupRequestedOffer } from "@/lib/auth/requested-offer"
 import {
   beginSignupEvidenceAttempt,
   isSupersededSignupEvidenceAttempt,
   saveSignupEvidence,
 } from "@/lib/auth/signup-evidence"
 import {
+  parseSignupOffer,
+  isSelfServeSignupOffer,
+  SIGNUP_OFFER_PARAM,
+} from "@/lib/auth/signup-offer"
+import {
   evaluateSignupRestriction,
   SignupRestrictedError,
   SIGNUP_RESTRICTED_MESSAGE,
 } from "@/lib/auth/signup-restrictions"
+import {
+  getPricingVersionAction,
+  getPublicBillingPlansAction,
+} from "@/lib/billing/plans-actions"
+import {
+  proAuthReturnPath,
+  starterAuthReturnPath,
+} from "@/lib/billing/pro-auth-return"
 import { DEFAULT_REGION } from "@/lib/cells"
 import {
   isCloudflareSignupObservationEnabled as readCloudflareObservationFlag,
@@ -313,8 +326,9 @@ export const signUpWithEmail = async (
   offer?: string,
   browserDiagnostics?: BrowserFingerprintDiagnostics,
   ycNext?: string,
+  rawSignupOffer?: string,
 ) => {
-  const requestedOffer = normalizeRequestedOffer(offer)
+  const requestedOffer = normalizeSignupRequestedOffer(offer)
   const parsed = signUpSchema.safeParse({ email, password, fullName })
   if (!parsed.success)
     return { success: false, error: parsed.error.issues[0].message }
@@ -446,23 +460,73 @@ export const signUpWithEmail = async (
     const appUrl =
       process.env.NEXT_PUBLIC_APP_URL || "https://console.superserve.ai"
     const callbackUrl = new URL("/auth/callback", appUrl)
-    const next = ycReturnPath(ycNext)
+    const next =
+      proAuthReturnPath(ycNext ?? null) ??
+      starterAuthReturnPath(ycNext ?? null) ??
+      ycReturnPath(ycNext)
     if (next) callbackUrl.searchParams.set("next", next)
     if (requestedOffer) callbackUrl.searchParams.set("offer", requestedOffer)
+    const offerIntent = rawSignupOffer ?? offer
+    let pricingVersion: "legacy" | "v2" | undefined
+    if (offerIntent === "enterprise") {
+      try {
+        pricingVersion = (await getPublicBillingPlansAction()).pricing_version
+      } catch {
+        return {
+          success: false,
+          error: "Pricing is unavailable. Please try signing up again.",
+        }
+      }
+    } else if (offerIntent) pricingVersion = await getPricingVersionAction()
+    const signupOffer =
+      offerIntent && pricingVersion === "v2"
+        ? parseSignupOffer(offerIntent)
+        : undefined
+    const routingOffer =
+      signupOffer ??
+      (offerIntent === "enterprise" ? "enterprise" : undefined) ??
+      (isSelfServeSignupOffer(offerIntent)
+        ? parseSignupOffer(offerIntent)
+        : undefined)
+    if (routingOffer)
+      callbackUrl.searchParams.set(SIGNUP_OFFER_PARAM, routingOffer)
     const redirectTo = callbackUrl.toString()
     const signupStartedAt = Date.now()
-    const { data, error } = await supabase.auth.admin.generateLink({
-      type: "signup",
-      email: parsed.data.email,
-      password: parsed.data.password,
-      options: {
-        data: {
-          full_name: parsed.data.fullName,
-          signup_attempt_id: signupAttemptId,
-        },
-        redirectTo,
-      },
-    })
+    const awaitingEnterpriseSetup = signupOffer === "enterprise"
+    const created = awaitingEnterpriseSetup
+      ? await supabase.auth.admin.createUser({
+          email: parsed.data.email,
+          password: parsed.data.password,
+          email_confirm: false,
+          user_metadata: {
+            full_name: parsed.data.fullName,
+            signup_attempt_id: signupAttemptId,
+          },
+          app_metadata: { signup_review: "pending" },
+        })
+      : null
+    const { data, error } = created?.error
+      ? { data: { user: null, properties: null }, error: created.error }
+      : await supabase.auth.admin.generateLink(
+          awaitingEnterpriseSetup
+            ? {
+                type: "magiclink",
+                email: parsed.data.email,
+                options: { redirectTo },
+              }
+            : {
+                type: "signup",
+                email: parsed.data.email,
+                password: parsed.data.password,
+                options: {
+                  data: {
+                    full_name: parsed.data.fullName,
+                    signup_attempt_id: signupAttemptId,
+                  },
+                  redirectTo,
+                },
+              },
+        )
     observationUserId = data?.user?.id ?? null
 
     if (error) {
@@ -541,10 +605,12 @@ export const signUpWithEmail = async (
     const tokenHash = data?.properties?.hashed_token
     if (!tokenHash)
       return { success: false, error: "Failed to generate confirmation link." }
-
     const confirmation = new URL(redirectTo)
     confirmation.searchParams.set("token_hash", tokenHash)
-    confirmation.searchParams.set("type", "signup")
+    confirmation.searchParams.set(
+      "type",
+      awaitingEnterpriseSetup ? data.properties.verification_type : "signup",
+    )
     confirmation.searchParams.set("signup_attempt_id", signupAttemptId)
     confirmation.searchParams.set("utm_source", "email")
     confirmation.searchParams.set("utm_medium", "signup_confirmation")
@@ -567,6 +633,7 @@ export const signUpWithEmail = async (
       "email",
       normalizeSignupEligibilitySnapshot(signupEligibilitySnapshot),
       requestedOffer,
+      ...(awaitingEnterpriseSetup ? [true] : []),
     ).catch(() => {})
     return { success: true }
   } catch (err) {

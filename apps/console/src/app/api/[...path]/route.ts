@@ -22,6 +22,10 @@ import {
   SignupRestrictedError,
   SIGNUP_RESTRICTED_MESSAGE,
 } from "@/lib/auth/signup-restrictions"
+import {
+  isSignupReviewBlocked,
+  SIGNUP_REVIEW_PENDING_MESSAGE,
+} from "@/lib/auth/signup-review"
 import { cellFor, DEFAULT_REGION } from "@/lib/cells"
 import { createServerClient } from "@/lib/supabase/server"
 
@@ -42,6 +46,28 @@ const ALLOWED_PREFIXES = [
   "billing/usage-series",
 ]
 
+const BILLING_V2_READ_PATHS = new Set([
+  "billing/plans/public",
+  "billing/plan",
+  "billing/free-allowance",
+  "billing/prepaid",
+])
+
+function isBillingV2ReadPath(path: string): boolean {
+  return (
+    BILLING_V2_READ_PATHS.has(path) || path === "billing/plan-change-preview"
+  )
+}
+
+function isPlanChangeWritePath(path: string): boolean {
+  return (
+    path === "billing/plan-changes" ||
+    /^billing\/plan-changes\/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\/undo$/i.test(
+      path,
+    )
+  )
+}
+
 function isTeamBillingPath(path: string): boolean {
   return (
     /^teams\/[^/]+\/billing\/usage$/.test(path) ||
@@ -56,6 +82,34 @@ function isStripeBillingPath(path: string): boolean {
     path === "stripe/customer-portal-session" ||
     isPlanBillingPath(path)
   )
+}
+
+const PREPAID_BILLING_METHODS: Record<string, string> = {
+  "billing/prepaid": "GET",
+  "billing/prepaid/checkout": "POST",
+  "billing/prepaid/auto-recharge": "PUT",
+}
+
+const PREPAID_WRITE_FIELDS: Record<string, string[]> = {
+  "billing/prepaid/checkout": [
+    "operation_id",
+    "amount_cents",
+    "success_url",
+    "cancel_url",
+  ],
+  "billing/prepaid/auto-recharge": [
+    "enabled",
+    "threshold_cents",
+    "amount_cents",
+  ],
+}
+
+function isPrepaidBillingPath(path: string): boolean {
+  return Object.hasOwn(PREPAID_BILLING_METHODS, path)
+}
+
+function isPrepaidBillingWrite(path: string): boolean {
+  return isPrepaidBillingPath(path) && PREPAID_BILLING_METHODS[path] !== "GET"
 }
 
 function isPlanBillingPath(path: string): boolean {
@@ -87,8 +141,10 @@ const FORWARD_REQUEST_HEADERS = new Set([
 ])
 
 function isAllowedPath(path: string): boolean {
+  if (isBillingV2ReadPath(path) || isPlanChangeWritePath(path)) return true
   if (isTeamBillingPath(path)) return true
   if (isStripeBillingPath(path)) return true
+  if (isPrepaidBillingPath(path)) return true
   return ALLOWED_PREFIXES.some(
     (prefix) => path === prefix || path.startsWith(`${prefix}/`),
   )
@@ -116,6 +172,19 @@ function hasUnsafePathSegment(path: string[]): boolean {
   })
 }
 
+function signupReviewPendingResponse() {
+  return NextResponse.json(
+    {
+      error: {
+        code: "signup_review_pending",
+        message: SIGNUP_REVIEW_PENDING_MESSAGE,
+      },
+      detail: SIGNUP_REVIEW_PENDING_MESSAGE,
+    },
+    { status: 403 },
+  )
+}
+
 function shouldSkipKeyInjection(path: string): boolean {
   return SKIP_KEY_INJECTION.some((prefix) => path.startsWith(prefix))
 }
@@ -130,6 +199,25 @@ function setImpersonationDebugHeaders(
   headers.set("x-console-auth-mode", authMode)
   headers.set("x-console-impersonating", impersonatedTeamId ? "true" : "false")
   headers.set("x-console-impersonated-team", impersonatedTeamId ?? "")
+}
+
+function validPaymentReturn(
+  value: unknown,
+  origin: string,
+  path: string,
+): boolean {
+  if (typeof value !== "string") return false
+  try {
+    const url = new URL(value)
+    return (
+      url.origin === origin &&
+      !url.username &&
+      !url.password &&
+      url.pathname.replace(/\/$/, "") === path
+    )
+  } catch {
+    return false
+  }
 }
 
 async function proxyRequest(
@@ -147,6 +235,16 @@ async function proxyRequest(
   const planRequest = isPlanBillingPath(joinedPath)
   if (planRequest && request.method !== "POST")
     return NextResponse.json({ error: "Method not allowed" }, { status: 405 })
+  if (
+    isPrepaidBillingPath(joinedPath) &&
+    request.method !== PREPAID_BILLING_METHODS[joinedPath]
+  )
+    return NextResponse.json({ error: "Method not allowed" }, { status: 405 })
+  const prepaidWrite = isPrepaidBillingWrite(joinedPath)
+  if (isBillingV2ReadPath(joinedPath) && request.method !== "GET")
+    return NextResponse.json({ error: "Method not allowed" }, { status: 405 })
+  if (isPlanChangeWritePath(joinedPath) && request.method !== "POST")
+    return NextResponse.json({ error: "Method not allowed" }, { status: 405 })
   const checkoutRequest =
     joinedPath === "stripe/checkout-session" && request.method === "POST"
   const debugImpersonation =
@@ -156,12 +254,40 @@ async function proxyRequest(
   let impersonationContext: { teamId: string; region: string } | null = null
   let impersonating = false
 
+  const bearer = request.headers
+    .get("authorization")
+    ?.match(/^bearer\s+(\S+)$/i)
+  if (skipKeyInjection && bearer) {
+    try {
+      const supabase = await createServerClient()
+      const { data, error } = await supabase.auth.getUser(bearer[1])
+      if (error?.code === "bad_jwt")
+        return NextResponse.json(
+          { error: "Invalid bearer token" },
+          { status: 401 },
+        )
+      if (error || !data?.user) throw new Error("Bearer lookup unavailable")
+      if (isSignupReviewBlocked(data.user)) return signupReviewPendingResponse()
+    } catch {
+      return NextResponse.json(
+        {
+          error: {
+            code: "authentication_unavailable",
+            message: "Authentication is temporarily unavailable. Please retry.",
+          },
+        },
+        { status: 503, headers: { "retry-after": "5" } },
+      )
+    }
+  }
+
   if (!skipKeyInjection) {
     const supabase = await createServerClient()
     const {
       data: { user: authUser },
     } = await supabase.auth.getUser()
     user = authUser
+    if (isSignupReviewBlocked(user)) return signupReviewPendingResponse()
     authObservedAt = new Date().toISOString()
     impersonationContext = await getImpersonationContext(user)
     impersonating = impersonationContext !== null
@@ -243,7 +369,13 @@ async function proxyRequest(
           )
         }
       }
-      if (checkoutRequest || planRequest)
+      if (
+        checkoutRequest ||
+        planRequest ||
+        prepaidWrite ||
+        isPlanChangeWritePath(joinedPath) ||
+        joinedPath === "billing/plan-change-preview"
+      )
         checkoutTeam = selfContext?.team ?? null
       apiKey = impersonationContext
         ? await getAuthApiKeyForUser(
@@ -297,6 +429,146 @@ async function proxyRequest(
       ? await request.arrayBuffer()
       : undefined
 
+  if (prepaidWrite) {
+    let input: unknown
+    try {
+      input = JSON.parse(new TextDecoder().decode(body as ArrayBuffer))
+    } catch {
+      input = null
+    }
+    if (
+      !checkoutTeam ||
+      !input ||
+      typeof input !== "object" ||
+      Array.isArray(input) ||
+      (input as Record<string, unknown>).expected_team !==
+        `${checkoutTeam.region}:${checkoutTeam.teamId}`
+    ) {
+      return NextResponse.json(
+        {
+          error: {
+            code: "plan_team_changed",
+            message: "Your active team changed. Reload to continue.",
+          },
+        },
+        { status: 409 },
+      )
+    }
+    const purchase = input as Record<string, unknown>
+    if (
+      joinedPath === "billing/prepaid/checkout" &&
+      (!validPaymentReturn(
+        purchase.success_url,
+        request.nextUrl.origin,
+        "/plan-usage/buy-credit",
+      ) ||
+        !validPaymentReturn(
+          purchase.cancel_url,
+          request.nextUrl.origin,
+          "/plan-usage/buy-credit",
+        ))
+    ) {
+      return NextResponse.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: "Invalid payment return URL",
+          },
+        },
+        { status: 400 },
+      )
+    }
+    if (
+      joinedPath === "billing/prepaid/checkout" &&
+      purchase.operation_id !== undefined &&
+      !validOperationId(purchase.operation_id)
+    )
+      return NextResponse.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: "Invalid purchase operation",
+          },
+        },
+        { status: 400 },
+      )
+    const fields = PREPAID_WRITE_FIELDS[joinedPath] ?? []
+    body = JSON.stringify(
+      Object.fromEntries(
+        fields
+          .filter((field) => field in (input as Record<string, unknown>))
+          .map((field) => [field, (input as Record<string, unknown>)[field]]),
+      ),
+    )
+  }
+
+  if (joinedPath === "billing/plan-change-preview") {
+    if (
+      !checkoutTeam ||
+      request.nextUrl.searchParams.get("expected_team") !==
+        `${checkoutTeam.region}:${checkoutTeam.teamId}`
+    ) {
+      return NextResponse.json(
+        {
+          error: {
+            code: "plan_team_changed",
+            message: "Your active team changed. Reload to continue.",
+          },
+        },
+        { status: 409 },
+      )
+    }
+    upstreamUrl.searchParams.delete("expected_team")
+  }
+
+  if (isPlanChangeWritePath(joinedPath)) {
+    let input: Record<string, unknown>
+    try {
+      input = JSON.parse(new TextDecoder().decode(body as ArrayBuffer))
+      if (!input || typeof input !== "object" || Array.isArray(input))
+        throw new Error("Invalid request")
+    } catch {
+      return NextResponse.json(
+        {
+          error: {
+            code: "invalid_request",
+            message: "Invalid plan change request",
+          },
+        },
+        { status: 400 },
+      )
+    }
+    if (
+      !checkoutTeam ||
+      input.expected_team !== `${checkoutTeam.region}:${checkoutTeam.teamId}`
+    ) {
+      return NextResponse.json(
+        {
+          error: {
+            code: "plan_team_changed",
+            message: "Your active team changed. Reload to continue.",
+          },
+        },
+        { status: 409 },
+      )
+    }
+    body =
+      joinedPath === "billing/plan-changes"
+        ? JSON.stringify({
+            target_plan: input.target_plan,
+            idempotency_key: input.idempotency_key,
+            preview_token: input.preview_token,
+            expected_effective_at: input.expected_effective_at,
+            confirm_pauses_running: input.confirm_pauses_running,
+            ...(typeof input.reason === "string"
+              ? { reason: input.reason }
+              : {}),
+          })
+        : "{}"
+    headers.delete("content-length")
+    headers.set("content-type", "application/json")
+  }
+
   if (planRequest) {
     let input: Record<string, unknown>
     try {
@@ -339,7 +611,11 @@ async function proxyRequest(
           const url = new URL(value as string)
           return (
             url.origin === request.nextUrl.origin &&
-            url.pathname.replace(/\/$/, "") === "/onboarding/plan"
+            !url.username &&
+            !url.password &&
+            (url.pathname.replace(/\/$/, "") === "/onboarding/plan" ||
+              (url.pathname.replace(/\/$/, "") === "/billing/pro" &&
+                url.searchParams.get("team") === input.expected_team))
           )
         } catch {
           return false
@@ -358,6 +634,7 @@ async function proxyRequest(
       upstreamUrl.pathname = "/stripe/checkout-session"
       body = JSON.stringify({
         offer: input.offer,
+        operation_id: input.operation_id,
         success_url: input.success_url,
         cancel_url: input.cancel_url,
       })
@@ -386,8 +663,6 @@ async function proxyRequest(
         )
       body = JSON.stringify({ restart: input.restart })
     }
-    headers.delete("content-length")
-    headers.set("content-type", "application/json")
     upstreamUrl.search = ""
   }
 
@@ -605,8 +880,6 @@ async function proxyRequest(
       await ensureCheckoutKey()
       const { actor: _actor, team: _team, ...fields } = intent
       body = JSON.stringify(fields)
-      headers.delete("content-length")
-      headers.set("content-type", "application/json")
       headers.set("X-Promotion-Account-Assertion", checkoutAssertion(intent))
       upstreamUrl.pathname = "/stripe/checkout-session/publication-decision"
     } catch {
@@ -626,6 +899,11 @@ async function proxyRequest(
         { status: 503 },
       )
     }
+  }
+
+  if (typeof body === "string") {
+    headers.delete("content-length")
+    headers.set("content-type", "application/json")
   }
 
   const response = await fetch(upstreamUrl.toString(), {
@@ -659,7 +937,12 @@ async function forwardResponse(
     }
     responseHeaders.set(key, value)
   }
-  if (joinedPath === "billing/summary" || isPlanBillingPath(joinedPath)) {
+  if (
+    joinedPath === "billing/summary" ||
+    isPlanBillingPath(joinedPath) ||
+    isPrepaidBillingPath(joinedPath) ||
+    isBillingV2ReadPath(joinedPath)
+  ) {
     responseHeaders.set("cache-control", "private, no-store")
   }
   setImpersonationDebugHeaders(

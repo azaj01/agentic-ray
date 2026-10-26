@@ -1,5 +1,10 @@
 import { type NextRequest, NextResponse } from "next/server"
 
+import { isSignupReviewBlocked } from "@/lib/auth/signup-review"
+import {
+  proAuthReturnPath,
+  starterAuthReturnPath,
+} from "@/lib/billing/pro-auth-return"
 import { createMiddlewareClient, matchesRoute } from "@/lib/supabase/middleware"
 import { ycReturnPath } from "@/lib/yc/return-path"
 import { staffReturnPath } from "@/lib/yc/staff-return-path"
@@ -10,6 +15,7 @@ const PUBLIC_ROUTES = [
   "/auth/forgot-password",
   "/auth/callback",
   "/auth/auth-code-error",
+  "/auth/pending",
   "/device",
   "/yc/confirm",
   "/yc/claim",
@@ -32,7 +38,9 @@ export async function middleware(request: NextRequest) {
     signinUrl.search = ""
     signinUrl.searchParams.set(
       "next",
-      ycReturnPath(pathname + request.nextUrl.search) ??
+      proAuthReturnPath(pathname + request.nextUrl.search) ??
+        starterAuthReturnPath(pathname + request.nextUrl.search) ??
+        ycReturnPath(pathname + request.nextUrl.search) ??
         (process.env.YC_STAFF_UI_ENABLED === "true"
           ? staffReturnPath(pathname + request.nextUrl.search)
           : null) ??
@@ -44,6 +52,20 @@ export async function middleware(request: NextRequest) {
     // Build the redirect on top of client.response so any refreshed Supabase
     // auth cookies (written by getUser() via setAll) survive the redirect.
     const redirect = NextResponse.redirect(signinUrl)
+    for (const cookie of client.response.cookies.getAll()) {
+      redirect.cookies.set(cookie)
+    }
+    return redirect
+  }
+
+  // Review state rides on the user getUser() already returned, so this adds
+  // no Auth round trip for anyone else.
+  if (user && !isPublicRoute && isSignupReviewBlocked(user)) {
+    await client.supabase.auth.signOut().catch(() => {})
+    const pendingUrl = request.nextUrl.clone()
+    pendingUrl.pathname = "/auth/pending"
+    pendingUrl.search = ""
+    const redirect = NextResponse.redirect(pendingUrl)
     for (const cookie of client.response.cookies.getAll()) {
       redirect.cookies.set(cookie)
     }

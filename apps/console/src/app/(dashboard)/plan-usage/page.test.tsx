@@ -7,6 +7,13 @@ import { ApiError } from "@/lib/api/client"
 import PlanUsagePage from "./page"
 import { bucketLabel, formatUsageCost } from "./page-client"
 
+const useTeamPlan = vi.fn()
+vi.mock("@/hooks/use-billing-v2", () => ({
+  useTeamPlan: (...args: unknown[]) => useTeamPlan(...args),
+  useFreeAllowance: () => ({ data: undefined }),
+  usePrepaidBalance: () => ({ data: undefined }),
+  useAllowancePricing: () => ({ data: undefined }),
+}))
 const useBillingSummary = vi.fn()
 const useBillingUsage = vi.fn()
 const useSandboxesPage = vi.fn()
@@ -45,6 +52,9 @@ vi.mock("@/hooks/use-customer-billing", () => ({
     useCustomerBillingExportPreview(...args),
 }))
 
+vi.mock("@/hooks/use-pricing-version", () => ({
+  usePricingVersion: () => "legacy",
+}))
 vi.mock("@/hooks/use-billing-summary", () => ({
   useBillingSummary: (...args: unknown[]) => useBillingSummary(...args),
 }))
@@ -83,6 +93,8 @@ function renderPage() {
 
 describe("PlanUsagePage", () => {
   beforeEach(() => {
+    useTeamPlan.mockReturnValue({ data: null })
+    useCustomerBillingPeriods.mockClear()
     useUser.mockReturnValue({
       user: { id: "user-1" },
       loading: false,
@@ -369,6 +381,77 @@ describe("PlanUsagePage", () => {
     rerender(page())
     assertRange("2026-07-01T00:00:00.000Z", "2026-08-01T00:00:00.000Z")
     expect(screen.getByText("Current Balance")).toBeInTheDocument()
+  })
+
+  it.each([
+    [
+      "failed",
+      {
+        data: undefined,
+        error: new ApiError(503, "unavailable", "Plan unavailable"),
+        isError: true,
+        isPending: false,
+      },
+    ],
+    [
+      "loading",
+      { data: undefined, error: null, isError: false, isPending: true },
+    ],
+  ])(
+    "preserves authorized billing controls when the plan query is %s",
+    (_, planQuery) => {
+      // useTeamPlan deliberately removes retained data on query errors. The
+      // independent summary still authorizes this existing customer's portal.
+      useTeamPlan.mockReturnValue(planQuery)
+      renderPage()
+      expect(screen.getByTestId("billing-statement")).toBeInTheDocument()
+      expect(screen.getByTestId("customer-billing-section")).toBeInTheDocument()
+      expect(
+        screen.getByRole("button", { name: "Open Customer Portal" }),
+      ).toBeInTheDocument()
+      expect(useCustomerBillingPeriods).toHaveBeenCalledWith(
+        "team-1",
+        "use:team-1",
+      )
+      expect(screen.getByText("Current Balance")).toBeInTheDocument()
+    },
+  )
+
+  it("retains paid history and credits after switching to Free without setup prompts", () => {
+    useTeamPlan.mockReturnValue({
+      data: {
+        key: "free",
+        kind: "free",
+        name: "Free",
+        limits: {
+          max_concurrent: 1,
+          max_vcpu: 1,
+          max_memory_mib: 1024,
+          max_disk_mib: 4096,
+          max_templates: 1,
+        },
+        pending_change: null,
+        period_start: null,
+        period_end: null,
+        fee_cents: null,
+        included_cents: null,
+      },
+    })
+    renderPage()
+    expect(screen.getByText("Current plan")).toBeInTheDocument()
+    expect(screen.getByText("Free")).toBeInTheDocument()
+    expect(screen.getByRole("link", { name: "Upgrade" })).toBeInTheDocument()
+    expect(
+      screen.queryByText(
+        /Set up billing|Payment setup required|Current Balance|Invoice history|no card required/,
+      ),
+    ).not.toBeInTheDocument()
+    expect(useCustomerBillingPeriods).toHaveBeenCalled()
+    expect(screen.getByText("Billing history")).toBeInTheDocument()
+    expect(screen.getByText("Credits remaining: $76.55")).toBeInTheDocument()
+    expect(
+      screen.getByRole("button", { name: "Open Customer Portal" }),
+    ).toBeInTheDocument()
   })
 
   it("shows the preview state when billing dashboard access is disabled", () => {

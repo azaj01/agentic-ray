@@ -11,7 +11,7 @@ import {
   BillingSummary,
   billingErrorMessage,
 } from "@/components/billing-summary"
-import { CurrentPlan } from "@/components/current-plan"
+import { PlanOverviewSection } from "@/components/billing/plan-overview-section"
 import { CustomerBillingSection } from "@/components/customer-billing-section"
 import { DateRangeFilter, type DateRange } from "@/components/date-range-filter"
 import { EmptyState } from "@/components/empty-state"
@@ -24,6 +24,7 @@ import {
 import { TableSkeleton } from "@/components/table-skeleton"
 import { useBillingSummary } from "@/hooks/use-billing-summary"
 import { useBillingUsage } from "@/hooks/use-billing-usage"
+import { useTeamPlan } from "@/hooks/use-billing-v2"
 import { useTeams } from "@/hooks/use-teams"
 import { useUser } from "@/hooks/use-user"
 import type {
@@ -185,6 +186,10 @@ export function PlanUsagePageClient() {
   const { user, loading: userLoading } = useUser()
   const teamsQuery = useTeams()
   const dashboardTeam = useDashboardTeamContext()
+  const teamPlan = useTeamPlan(!userLoading && !!user).data
+  // A failed plan lookup must not hide independently authorized billing data.
+  // Only a confirmed Free assignment suppresses payment setup.
+  const showPayments = teamPlan?.kind !== "free"
   const summaryQuery = useBillingSummary(!userLoading && !!user)
   // Do not render retained summary data after a failed refresh. The billing
   // query is team-scoped, but React Query can still expose the last successful
@@ -352,8 +357,8 @@ export function PlanUsagePageClient() {
               />
             ) : summary ? (
               <>
-                <CurrentPlan summary={summary} />
-                <BillingSummary summary={summary} />
+                <PlanOverviewSection summary={summary} />
+                {showPayments ? <BillingSummary summary={summary} /> : null}
               </>
             ) : null}
 
@@ -363,6 +368,7 @@ export function PlanUsagePageClient() {
                 teamRegion={billingTeam.region}
                 teamName={billingTeam.name}
                 summary={summary ?? null}
+                cardless={teamPlan?.kind === "free"}
               />
             )}
 

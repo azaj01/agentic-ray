@@ -11,7 +11,12 @@ import { Suspense, useEffect, useState } from "react"
 import { CornerBrackets } from "@/components/corner-brackets"
 import { DitherBackground } from "@/components/dither-background"
 import { GoogleIcon, Spinner } from "@/components/icons"
-import { normalizeRequestedOffer } from "@/lib/auth/requested-offer"
+import { normalizeSignupRequestedOffer } from "@/lib/auth/requested-offer"
+import {
+  SIGNUP_OFFER_PARAM,
+  signInOfferDestination,
+  isSelfServeSignupOffer,
+} from "@/lib/auth/signup-offer"
 import { AUTH_EVENTS } from "@/lib/posthog/events"
 import { createBrowserClient } from "@/lib/supabase/client"
 
@@ -25,7 +30,11 @@ function SignInContent() {
   const [showPassword, setShowPassword] = useState(false)
   const [errors, setErrors] = useState<Record<string, string>>({})
   const searchParams = useSearchParams()
-  const requestedOffer = normalizeRequestedOffer(searchParams.get("offer"))
+  const rawOffer =
+    searchParams.get(SIGNUP_OFFER_PARAM) ||
+    searchParams.get("offer") ||
+    undefined
+  const requestedOffer = normalizeSignupRequestedOffer(rawOffer)
   const posthog = usePostHog()
 
   const rawNext = searchParams.get("next") || "/"
@@ -38,6 +47,8 @@ function SignInContent() {
 
   const signUpParams = new URLSearchParams()
   if (requestedOffer) signUpParams.set("offer", requestedOffer)
+  if (rawOffer && rawOffer !== requestedOffer)
+    signUpParams.set(SIGNUP_OFFER_PARAM, rawOffer)
   if (nextUrl !== "/") signUpParams.set("next", nextUrl)
   const signUpHref = `/auth/signup${signUpParams.size ? `?${signUpParams}` : ""}`
 
@@ -58,7 +69,11 @@ function SignInContent() {
         }
         if (user) {
           setIsEmailLoading(true)
-          window.location.replace(nextUrl)
+          window.location.replace(
+            nextUrl === "/" && isSelfServeSignupOffer(rawOffer)
+              ? signInOfferDestination(rawOffer)
+              : nextUrl,
+          )
         }
       } catch {
         setIsEmailLoading(false)
@@ -66,7 +81,7 @@ function SignInContent() {
       }
     }
     checkUser()
-  }, [nextUrl])
+  }, [nextUrl, rawOffer])
 
   const handleEmailSignIn = async (e: React.FormEvent) => {
     e.preventDefault()
@@ -103,7 +118,11 @@ function SignInContent() {
       }
       posthog.capture(AUTH_EVENTS.SIGN_IN_COMPLETED, { method: "email" })
       // Discard routes prefetched before the session cookies were set.
-      window.location.replace(nextUrl)
+      window.location.replace(
+        nextUrl === "/" && isSelfServeSignupOffer(rawOffer)
+          ? signInOfferDestination(rawOffer)
+          : nextUrl,
+      )
       navigating = true
     } catch {
       setErrors({ form: "Error signing in. Please try again." })
@@ -120,6 +139,8 @@ function SignInContent() {
       const intentId = await beginGoogleSignIn()
       const callbackUrl = new URL("/auth/callback", window.location.origin)
       if (requestedOffer) callbackUrl.searchParams.set("offer", requestedOffer)
+      if (rawOffer && rawOffer !== requestedOffer)
+        callbackUrl.searchParams.set(SIGNUP_OFFER_PARAM, rawOffer)
       if (intentId)
         callbackUrl.searchParams.set("google_signin_intent", intentId)
       if (nextUrl && nextUrl !== "/") {

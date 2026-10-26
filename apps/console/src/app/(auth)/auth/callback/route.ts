@@ -1,4 +1,4 @@
-import type { Session } from "@supabase/supabase-js"
+import type { Session, User } from "@supabase/supabase-js"
 import { cookies } from "next/headers"
 import { NextResponse } from "next/server"
 
@@ -8,6 +8,8 @@ import {
   sendWelcomeEmail,
 } from "@/app/(auth)/auth/signup/action"
 import { publishOriginalSignupEvidence } from "@/lib/api/promotion-publication"
+import { getSignupPlanAction } from "@/lib/api/signup-plan-actions"
+import { SignupSetupBlockedError } from "@/lib/api/signup-setup-error"
 import { listTeamMembershipsForUserDetailed } from "@/lib/api/team-directory"
 import { completedMemberships } from "@/lib/api/team-provisioning"
 import { isGenericAuthSignupFailure } from "@/lib/auth/errors"
@@ -22,9 +24,10 @@ import {
   markGoogleSignupAttempt,
   readGooglePromotionEvidence,
   retainOriginalGoogleSignup,
+  revokeGoogleSignupAuthorization,
 } from "@/lib/auth/google-signup-proof"
 import { PLAN_OFFER_COOKIE } from "@/lib/auth/plan-preselection"
-import { normalizeRequestedOffer } from "@/lib/auth/requested-offer"
+import { normalizeSignupRequestedOffer } from "@/lib/auth/requested-offer"
 import {
   isActiveSignupEvidenceAttempt,
   readSignupEvidence,
@@ -32,9 +35,35 @@ import {
   saveSignupEvidence,
 } from "@/lib/auth/signup-evidence"
 import {
+  parseSignupOffer,
+  isSelfServeSignupOffer,
+  SIGNUP_OFFER_DESTINATIONS,
+  SIGNUP_OFFER_PARAM,
+} from "@/lib/auth/signup-offer"
+import {
   evaluateSignupRestriction,
   SignupRestrictedError,
 } from "@/lib/auth/signup-restrictions"
+import {
+  hasPendingEnterprisePricing,
+  isSignupReviewBlocked,
+  signupReviewStatus,
+} from "@/lib/auth/signup-review"
+import {
+  encodePendingProfile,
+  PENDING_PROFILE_COOKIE,
+  pendingProfileCookieOptions,
+  updateSignupReviewMetadata,
+} from "@/lib/auth/signup-review-server"
+import {
+  getPricingVersionAction,
+  getPublicBillingPlansAction,
+} from "@/lib/billing/plans-actions"
+import {
+  proAuthReturnPath,
+  starterAuthReturnPath,
+  signupPreparationReturnPath,
+} from "@/lib/billing/pro-auth-return"
 import { DEFAULT_REGION } from "@/lib/cells"
 import { validSignupDeviceBinding } from "@/lib/fingerprint/binding-proof"
 import { fingerprintDiagnostics } from "@/lib/fingerprint/diagnostics-server"
@@ -71,9 +100,37 @@ function sanitizeNext(raw: string | null): string {
   return "/"
 }
 
+/** Ends the session of an account awaiting Enterprise setup. */
+async function pendingSignupResponse(
+  supabase: Awaited<ReturnType<typeof createServerClient>>,
+  origin: string,
+  user: User,
+) {
+  try {
+    await supabase.auth.signOut()
+  } catch {
+    console.warn("Pending signup sign-out failed")
+  }
+  const response = NextResponse.redirect(
+    buildRedirectUrl(origin, "/auth/pending"),
+  )
+  response.cookies.delete(PLAN_OFFER_COOKIE)
+  response.cookies.set(
+    PENDING_PROFILE_COOKIE,
+    encodePendingProfile({
+      name: user.user_metadata?.full_name,
+      email: user.email,
+    }),
+    pendingProfileCookieOptions,
+  )
+  return response
+}
+
 export async function GET(request: Request) {
   const { searchParams, origin } = new URL(request.url)
-  const requestedOffer = normalizeRequestedOffer(searchParams.get("offer"))
+  const requestedOffer = normalizeSignupRequestedOffer(
+    searchParams.get("offer"),
+  )
   const code = searchParams.get("code")
   const tokenHash = searchParams.get("token_hash")
   const type = searchParams.get("type") as
@@ -162,6 +219,151 @@ export async function GET(request: Request) {
             return response
           }
         }
+        const pendingEnterprisePricing = hasPendingEnterprisePricing(user)
+        if (
+          isSignupReviewBlocked(user) &&
+          (!pendingEnterprisePricing ||
+            signupReviewStatus(user) === "pending" ||
+            signupReviewStatus(user) === "rejected")
+        )
+          return pendingSignupResponse(supabase, origin, user)
+        let offerIntent = pendingEnterprisePricing
+          ? "enterprise"
+          : (searchParams.get(SIGNUP_OFFER_PARAM) ?? searchParams.get("offer"))
+        let enterprisePricing: "legacy" | "v2" | undefined
+        let provenExistingGoogle: GoogleMembershipState | undefined
+        if (offerIntent === "enterprise") {
+          try {
+            enterprisePricing = (await getPublicBillingPlansAction())
+              .pricing_version
+          } catch {
+            if (code && isGoogleUser(user) && !pendingEnterprisePricing) {
+              try {
+                const memberships = await completedMemberships(
+                  user.id,
+                  await listTeamMembershipsForUserDetailed(user.id, {
+                    maxAgeMs: 0,
+                  }),
+                )
+                if (memberships.degradedRegions.length)
+                  throw new Error("Enterprise membership unavailable")
+                const directory = await classifyGoogleMembershipState(
+                  user.id,
+                  memberships,
+                )
+                // A query cannot place an existing customer on hold. Persist only
+                // after a complete directory read proves this account is new.
+                if (directory.kind === "indeterminate")
+                  throw new Error("Enterprise membership unavailable")
+                if (directory.kind === "existing") {
+                  provenExistingGoogle = directory
+                  // Existing membership already authorizes this account's
+                  // sign-in; a fresh signup preference cannot revoke it.
+                  offerIntent = null
+                } else if (
+                  directory.kind === "first_time" &&
+                  !signupReviewStatus(user)
+                ) {
+                  await updateSignupReviewMetadata(user.id, {
+                    signup_enterprise_pricing_pending: true,
+                  })
+                }
+              } catch {
+                await revokeGoogleSignupAuthorization(
+                  user.id,
+                  searchParams.get("signup_attempt_id") || undefined,
+                ).catch(() => {})
+              }
+            }
+            if (!provenExistingGoogle) {
+              await supabase.auth.signOut().catch(() => {})
+              return NextResponse.redirect(
+                buildRedirectUrl(
+                  origin,
+                  "/auth/auth-code-error?reason=pricing_unavailable&signup_offer=enterprise",
+                ),
+              )
+            }
+          }
+          if (pendingEnterprisePricing) {
+            await updateSignupReviewMetadata(user.id, {
+              signup_enterprise_pricing_pending: false,
+              ...(enterprisePricing === "v2"
+                ? { signup_review: "pending" }
+                : {}),
+            })
+            if (enterprisePricing === "v2")
+              return pendingSignupResponse(supabase, origin, user)
+          }
+        }
+        const signupOffer =
+          offerIntent &&
+          (isSelfServeSignupOffer(offerIntent) ||
+            (enterprisePricing ?? (await getPricingVersionAction())) === "v2")
+            ? parseSignupOffer(offerIntent)
+            : undefined
+        // Authentication has consumed the code/token before directory reads.
+        // Keep only bounded navigation intent so a transient read can resume
+        // through fresh actor/team/policy checks without replaying that token.
+        const preparationReturn = signupPreparationReturnPath(next)
+        const preparationIntent = preparationReturn
+          ? new URL(preparationReturn, origin).searchParams
+          : null
+        const directPaidNext =
+          proAuthReturnPath(next) ?? starterAuthReturnPath(next)
+        const defaultPaidNext =
+          (!searchParams.get("next") || searchParams.get("next") === "/") &&
+          !(await cookies()).get("yc_claim_confirmation") &&
+          (signupOffer === "starter" || signupOffer === "pro_monthly")
+            ? SIGNUP_OFFER_DESTINATIONS[signupOffer]
+            : null
+        let retryPaidNext =
+          preparationIntent?.get("next") ?? directPaidNext ?? defaultPaidNext
+        // A preparation return can pin its team outside the nested paid URL.
+        // Carry that locator into the retry rather than falling back to the
+        // browser's newly selected team after the directory recovers.
+        if (retryPaidNext && preparationIntent?.get("team")) {
+          const paid = new URL(retryPaidNext, origin)
+          paid.searchParams.set("team", preparationIntent.get("team")!)
+          retryPaidNext = paid.pathname + paid.search
+        }
+        const paidSetupRecovery =
+          signupOffer !== "enterprise" &&
+          !pendingEnterprisePricing &&
+          retryPaidNext
+            ? `/auth/auth-code-error?${new URLSearchParams({
+                reason: "account_setup",
+                account: preparationIntent?.get("account") ?? user.id,
+                next: retryPaidNext,
+              })}`
+            : null
+        const membershipFailureResponse = (googleProofRecovery = false) => {
+          if (googleProofRecovery && paidSetupRecovery) {
+            // The directory has not established a new Google account yet, so
+            // its pre-auth proof must remain unbound. Resume through signup's
+            // proof gate rather than repeatedly attempting first-team setup.
+            const saved = new URL(paidSetupRecovery, origin).searchParams
+            const preparation = `/api/onboarding/prepare/?${new URLSearchParams(
+              {
+                account: saved.get("account")!,
+                next: saved.get("next")!,
+              },
+            )}`
+            return NextResponse.redirect(
+              buildRedirectUrl(
+                origin,
+                `/auth/signup?${new URLSearchParams({ complete_google: "1", next: preparation })}`,
+              ),
+            )
+          }
+          return NextResponse.redirect(
+            buildRedirectUrl(
+              origin,
+              paidSetupRecovery ??
+                "/auth/auth-code-error?reason=membership_lookup_degraded",
+            ),
+          )
+        }
         const signupAttemptId =
           searchParams.get("signup_attempt_id") || undefined
         const provider = code
@@ -183,15 +385,17 @@ export async function GET(request: Request) {
           }
           let directory: GoogleMembershipState
           try {
-            directory = await classifyGoogleMembershipState(
-              user.id,
-              await completedMemberships(
+            directory =
+              provenExistingGoogle ??
+              (await classifyGoogleMembershipState(
                 user.id,
-                await listTeamMembershipsForUserDetailed(user.id, {
-                  maxAgeMs: 0,
-                }),
-              ),
-            )
+                await completedMemberships(
+                  user.id,
+                  await listTeamMembershipsForUserDetailed(user.id, {
+                    maxAgeMs: 0,
+                  }),
+                ),
+              ))
           } catch {
             // Return a response so retained origin cookies survive lookup failures.
             directory = { kind: "indeterminate", degradedRegions: [] }
@@ -208,12 +412,7 @@ export async function GET(request: Request) {
               stage: "callback",
               degradedRegions: directory.degradedRegions,
             })
-            return NextResponse.redirect(
-              buildRedirectUrl(
-                origin,
-                "/auth/auth-code-error?reason=membership_lookup_degraded",
-              ),
-            )
+            return membershipFailureResponse(true)
           }
 
           isNewUser = directory.kind === "first_time"
@@ -241,6 +440,12 @@ export async function GET(request: Request) {
               recoveryUrl.searchParams.set("complete_google", "1")
               if (requestedOffer)
                 recoveryUrl.searchParams.set("offer", requestedOffer)
+              const signupOfferParam = offerIntent
+              if (signupOfferParam)
+                recoveryUrl.searchParams.set(
+                  SIGNUP_OFFER_PARAM,
+                  signupOfferParam,
+                )
               if (next !== "/") recoveryUrl.searchParams.set("next", next)
               return NextResponse.redirect(
                 buildRedirectUrl(
@@ -250,6 +455,28 @@ export async function GET(request: Request) {
               )
             }
             console.info("Google OAuth signup proof validated at callback")
+            if (signupOffer === "enterprise") {
+              try {
+                await updateSignupReviewMetadata(user.id, {
+                  signup_review: "pending",
+                })
+              } catch (holdError) {
+                console.error("Enterprise signup hold failed", holdError)
+                await revokeGoogleSignupAuthorization(
+                  user.id,
+                  signupAttemptId,
+                ).catch((error) =>
+                  console.error(
+                    "Enterprise signup proof cleanup failed",
+                    error,
+                  ),
+                )
+                await supabase.auth.signOut().catch(() => {})
+                return NextResponse.redirect(
+                  buildRedirectUrl(origin, "/auth/auth-code-error"),
+                )
+              }
+            }
             await markGoogleSignupAttempt(signupAttemptId, user.id)
           }
 
@@ -374,22 +601,22 @@ export async function GET(request: Request) {
 
         newSignup = type !== "invite" && (type === "signup" || isNewUser)
         if (type !== "invite" && (type === "signup" || (code && isNewUser))) {
-          const directory = await completedMemberships(
-            user.id,
-            await listTeamMembershipsForUserDetailed(user.id, {
-              maxAgeMs: 0,
-            }),
-          )
+          let directory: Awaited<ReturnType<typeof completedMemberships>>
+          try {
+            directory = await completedMemberships(
+              user.id,
+              await listTeamMembershipsForUserDetailed(user.id, {
+                maxAgeMs: 0,
+              }),
+            )
+          } catch {
+            return membershipFailureResponse()
+          }
           if (
             directory.memberships.length === 0 &&
             directory.degradedRegions.length > 0
           )
-            return NextResponse.redirect(
-              buildRedirectUrl(
-                origin,
-                "/auth/auth-code-error?reason=membership_lookup_degraded",
-              ),
-            )
+            return membershipFailureResponse()
           if (
             directory.memberships.length === 0 &&
             directory.degradedRegions.length === 0
@@ -429,6 +656,18 @@ export async function GET(request: Request) {
           }
         }
 
+        if (code && isNewUser && signupOffer === "enterprise") {
+          await notifySlackOfNewUser(
+            user.email || "",
+            user.user_metadata?.full_name || null,
+            provider,
+            normalizeSignupEligibilitySnapshot(signupEligibilitySnapshot),
+            requestedOffer,
+            true,
+          ).catch(() => {})
+          return pendingSignupResponse(supabase, origin, user)
+        }
+
         if (isNewUser) {
           await notifySlackOfNewUser(
             user.email || "",
@@ -460,6 +699,8 @@ export async function GET(request: Request) {
           },
         )
 
+        const proNext = proAuthReturnPath(next) ?? starterAuthReturnPath(next)
+        const preparationNext = signupPreparationReturnPath(next)
         const ycNext =
           ycReturnPath(next) ??
           (process.env.YC_STAFF_UI_ENABLED === "true"
@@ -469,16 +710,55 @@ export async function GET(request: Request) {
           !next.startsWith("/device") &&
           !next.startsWith("https://") &&
           !/^\/onboarding\/plan\/?(?:\?|$)/.test(next) &&
-          !ycNext
+          !ycNext &&
+          !proNext &&
+          !preparationNext
         ) {
           next = "/sandboxes"
         }
         if (ycNext) next = ycNext
+        if (proNext) next = proNext
+        if (preparationNext) next = preparationNext
         if (
           next === "/sandboxes" &&
           (await cookies()).get("yc_claim_confirmation")
         ) {
           next = "/yc/claim"
+        }
+        if (
+          signupOffer &&
+          next === "/sandboxes" &&
+          (!searchParams.get("next") || searchParams.get("next") === "/") &&
+          (newSignup || signupOffer !== "enterprise")
+        )
+          next = SIGNUP_OFFER_DESTINATIONS[signupOffer]
+        if (
+          newSignup &&
+          (proAuthReturnPath(next) || starterAuthReturnPath(next))
+        ) {
+          // First-team setup must finish while this route can write cookies.
+          // Otherwise the dashboard's generic preparation redirect discards
+          // the selected payment page before assigning the initial Free plan.
+          try {
+            await getSignupPlanAction(
+              new URL(next, origin).searchParams.get("team") ?? undefined,
+              user.id,
+              undefined,
+              next,
+            )
+          } catch (error) {
+            const recovery = new URLSearchParams({
+              reason:
+                error instanceof SignupSetupBlockedError
+                  ? error.reason
+                  : "account_setup",
+              account: user.id,
+              next,
+            })
+            return NextResponse.redirect(
+              buildRedirectUrl(origin, `/auth/auth-code-error?${recovery}`),
+            )
+          }
         }
       }
 

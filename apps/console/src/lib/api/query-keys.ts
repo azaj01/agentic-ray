@@ -79,6 +79,7 @@ export const networkKeys = {
 
 export const billingKeys = {
   all: ["billing"] as const,
+  publicPlans: (region: string) => ["billing", "public-plans", region] as const,
   customer: {
     all: ["billing", "customer"] as const,
     exportPreview: (context: {
@@ -120,10 +121,48 @@ export const billingKeys = {
         context.periodEnd,
       ] as const,
   },
+  planChangePreview: (context: {
+    cacheScope: string
+    teamKey: string
+    target: string
+  }) =>
+    [
+      ...billingKeys.all,
+      "v2",
+      "plan-change-preview",
+      context.cacheScope,
+      context.teamKey,
+      context.target,
+    ] as const,
+  v2: (
+    resource: "plan" | "free-allowance" | "prepaid",
+    context: { cacheScope: string; teamKey: string },
+  ) =>
+    [
+      ...billingKeys.all,
+      "v2",
+      resource,
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  pricingVersion: (context: { cacheScope: string; teamKey: string }) =>
+    [
+      ...billingKeys.all,
+      "pricing-version",
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
   summary: (context: { cacheScope: string; teamKey: string }) =>
     [
       ...billingKeys.all,
       "summary",
+      context.cacheScope,
+      context.teamKey,
+    ] as const,
+  prepaid: (context: { cacheScope: string; teamKey: string }) =>
+    [
+      ...billingKeys.all,
+      "prepaid",
       context.cacheScope,
       context.teamKey,
     ] as const,

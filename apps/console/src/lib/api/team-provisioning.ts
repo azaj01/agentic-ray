@@ -1,11 +1,22 @@
 import type { User } from "@supabase/supabase-js"
 
 import {
+  authorizeEnterpriseProvisioning,
+  enterpriseProvisioningContext,
+  type EnterpriseProvisioningAuthority,
+} from "@/lib/admin/enterprise-provisioning-authority"
+import {
+  recoverPromotionTeamForEnterprise,
+  preparePromotionTeamForEnterprise,
+  completePromotionTeamForEnterprise,
   recoverPromotionTeam,
   preparePromotionTeam,
   completePromotionTeam,
 } from "@/lib/api/promotion-device-evidence"
-import { publishAccountPromotion } from "@/lib/api/promotion-publication"
+import {
+  publishAccountPromotion,
+  publishEnterpriseAccountPromotion,
+} from "@/lib/api/promotion-publication"
 import {
   listTeamMembershipsForUserDetailed,
   type MembershipDirectory,
@@ -23,6 +34,10 @@ import {
   type SignupEvidenceEntry,
 } from "@/lib/auth/signup-evidence"
 import { evaluateSignupRestriction } from "@/lib/auth/signup-restrictions"
+import {
+  assertSignupReviewCleared,
+  signupReviewStatus,
+} from "@/lib/auth/signup-review"
 import { cellFor, DEFAULT_REGION } from "@/lib/cells"
 import { createServerClient } from "@/lib/supabase/server"
 
@@ -196,12 +211,65 @@ export async function provisionTeam(
   if (!user || !observedAt || user.id !== userId) {
     throw new Error("Authenticated user mismatch")
   }
-  const googleUser = isGoogleUser(user)
-  const googleProvisioning = googleUser
+  assertSignupReviewCleared(user)
+  return provisionTeamFor(region, user, name, observedAt, operationId, {
+    googleProof: isGoogleUser(user),
+  })
+}
+
+/**
+ * Creates the first team of an Enterprise applicant staff are granting access.
+ * The account is still held, and its Google signup proof was checked when the
+ * hold was placed, so neither is checked here. Retries recover the same team.
+ */
+export async function provisionHeldApplicantTeam(
+  user: User,
+  region: string,
+  planVersionId: string,
+): Promise<ProvisionedTeam> {
+  if (signupReviewStatus(user) !== "pending")
+    throw new Error("Only held applicants are provisioned by staff")
+  const authority = await authorizeEnterpriseProvisioning(
+    user.id,
+    region,
+    planVersionId,
+  )
+  const { user: applicant } = enterpriseProvisioningContext(
+    authority,
+    user.id,
+    region,
+    user.id,
+  )
+  return provisionTeamFor(
+    region,
+    applicant,
+    applicant.email ?? applicant.id,
+    new Date().toISOString(),
+    user.id,
+    { googleProof: false, enterpriseAuthority: authority },
+  )
+}
+
+async function provisionTeamFor(
+  region: string,
+  user: User,
+  name: string,
+  observedAt: string,
+  operationId: string | undefined,
+  {
+    googleProof,
+    enterpriseAuthority,
+  }: {
+    googleProof: boolean
+    enterpriseAuthority?: EnterpriseProvisioningAuthority
+  },
+): Promise<ProvisionedTeam> {
+  const userId = user.id
+  const googleProvisioning = googleProof
     ? await guardFirstGoogleTeam(userId, user)
     : null
   let firstTeam = googleProvisioning !== null
-  if (!googleUser) {
+  if (!googleProof) {
     const directory = await completedMemberships(
       userId,
       await listTeamMembershipsForUserDetailed(userId, { maxAgeMs: 0 }),
@@ -231,12 +299,27 @@ export async function provisionTeam(
   if (!operationId && region !== DEFAULT_REGION)
     throw new Error("Team creation requires its original operation identifier")
   const locator = { userId, region, operationId: operationId ?? userId }
-  let prepared = await recoverPromotionTeam(locator)
+  let prepared = enterpriseAuthority
+    ? await recoverPromotionTeamForEnterprise(locator, enterpriseAuthority)
+    : await recoverPromotionTeam(locator)
   if (!prepared) {
     if (!operationId && !firstTeam)
       throw new Error("No initial team creation to recover")
-    const publication = await publishAccountPromotion(region, user, observedAt)
-    prepared = await preparePromotionTeam({ ...locator, name, ...publication })
+    const publication = enterpriseAuthority
+      ? await publishEnterpriseAccountPromotion(
+          region,
+          user,
+          observedAt,
+          enterpriseAuthority,
+        )
+      : await publishAccountPromotion(region, user, observedAt)
+    const preparation = { ...locator, name, ...publication }
+    prepared = enterpriseAuthority
+      ? await preparePromotionTeamForEnterprise(
+          preparation,
+          enterpriseAuthority,
+        )
+      : await preparePromotionTeam(preparation)
   }
   if (prepared.authorityUnavailable) {
     // Repair only the regional FK target. The persisted no-credit decision
@@ -249,7 +332,9 @@ export async function provisionTeam(
       )
     if (error) throw new Error("Failed to repair regional profile")
   }
-  const completed = await completePromotionTeam(prepared)
+  const completed = enterpriseAuthority
+    ? await completePromotionTeamForEnterprise(prepared, enterpriseAuthority)
+    : await completePromotionTeam(prepared)
   if (completed.state === "deleted")
     throw new Error("This team creation has already been deleted")
   const team = { id: completed.teamId, name: completed.name }

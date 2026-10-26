@@ -1,10 +1,72 @@
+import { render, screen, cleanup, waitFor } from "@testing-library/react"
+import userEvent from "@testing-library/user-event"
+import {
+  createElement,
+  cloneElement,
+  type ReactElement,
+  type ReactNode,
+} from "react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
+
+let retrySearch = new URLSearchParams()
+const mockRetryOAuth = vi.fn()
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => retrySearch,
+  redirect: (url: string) => {
+    throw Object.assign(new Error(url), { redirect: true })
+  },
+  unstable_rethrow: (error: { redirect?: boolean }) => {
+    if (error.redirect) throw error
+  },
+}))
+vi.mock("next/image", () => ({ default: () => null }))
+vi.mock("next/link", () => ({
+  default: ({ href, children }: { href: string; children: ReactNode }) =>
+    createElement("a", { href }, children),
+}))
+vi.mock("@/components/corner-brackets", () => ({ CornerBrackets: () => null }))
+vi.mock("@/components/dither-background", () => ({
+  DitherBackground: () => null,
+}))
+vi.mock("@/lib/supabase/client", () => ({
+  createBrowserClient: () => ({
+    auth: {
+      getUser: async () => ({ data: { user: null }, error: null }),
+      signInWithOAuth: (...args: unknown[]) => mockRetryOAuth(...args),
+    },
+  }),
+}))
+vi.mock("@/app/(auth)/auth/signin/google-action", () => ({
+  beginGoogleSignIn: async () => "retry-origin",
+}))
+vi.mock("@superserve/ui", () => ({
+  Button: ({
+    render: element,
+    children,
+    ...props
+  }: {
+    render?: ReactElement
+    children?: ReactNode
+  }) =>
+    element
+      ? cloneElement(element, {}, children)
+      : createElement("button", props, children),
+  Input: () => null,
+}))
+vi.mock("posthog-js/react", () => ({
+  usePostHog: () => ({ capture: vi.fn() }),
+}))
 
 let currentUser: {
   id: string
   email: string
   created_at: string
-  app_metadata: { provider: string; providers?: string[] }
+  app_metadata: {
+    provider: string
+    providers?: string[]
+    signup_review?: string
+    signup_enterprise_pricing_pending?: boolean
+  }
   user_metadata: { full_name?: string }
 } | null = null
 
@@ -22,6 +84,35 @@ let googleMembershipState:
 }
 let authExchangeError: { message: string } | null = null
 let authVerifyOtpError: { message: string } | null = null
+
+const mockGetSignupPlanAction = vi.fn()
+const mockPrepareTeam = vi.fn()
+const mockReadSignupPlan = vi.fn()
+vi.mock("@/lib/api/signup-plan-actions", () => ({
+  getSignupPlanAction: (...args: unknown[]) => mockGetSignupPlanAction(...args),
+}))
+vi.mock("@/lib/api/proxy-auth", () => ({
+  getAuthApiKeyAndTeamForUser: (...args: unknown[]) => mockPrepareTeam(...args),
+}))
+vi.mock("@/lib/api/signup-plan-read", () => ({
+  readSignupPlan: (...args: unknown[]) => mockReadSignupPlan(...args),
+}))
+vi.mock("@/lib/admin/impersonation", () => ({
+  getImpersonationContext: async () => null,
+}))
+vi.mock("@/lib/api/active-team", () => ({
+  readTeamSelection: async () => null,
+  pickActiveTeam: (teams: unknown[]) => teams[0],
+}))
+vi.mock("@/lib/api/teams-actions", () => ({
+  listTeamsAction: async () => ({
+    teams: directoryState.memberships.map((t) => ({
+      id: t.teamId,
+      region: t.region,
+      name: "Team",
+    })),
+  }),
+}))
 
 const mockCompleteStaffGoogle = vi.fn()
 vi.mock("@/lib/yc/staff-session", async (importOriginal) => ({
@@ -124,6 +215,7 @@ const mockHasValidGoogleSignupProof = vi.fn()
 const mockHasValidLegacyGoogleSignupProof = vi.fn()
 const mockConsumeGoogleSignupProof = vi.fn()
 const mockMarkGoogleSignupAttempt = vi.fn()
+const mockRevokeGoogleSignupAuthorization = vi.fn()
 const mockRetainGoogleSignupVisitor = vi.fn()
 const mockReadGoogleSignupVisitors = vi.fn()
 const mockReadGooglePromotionEvidence = vi.fn()
@@ -149,6 +241,7 @@ vi.mock("@/lib/api/team-directory", () => ({
   ) => mockListTeamMembershipsForUserDetailed(...args),
 }))
 vi.mock("@/lib/auth/google-signup-proof", () => ({
+  GoogleSignupRecoveryRequiredError: class extends Error {},
   hasValidGoogleSignupProof: (...args: unknown[]) =>
     mockHasValidGoogleSignupProof(...args),
   hasValidLegacyGoogleSignupProof: (...args: unknown[]) =>
@@ -159,6 +252,8 @@ vi.mock("@/lib/auth/google-signup-proof", () => ({
     mockRetainOriginalGoogleSignup(...args),
   readGooglePromotionEvidence: (...args: unknown[]) =>
     mockReadGooglePromotionEvidence(...args),
+  revokeGoogleSignupAuthorization: (...args: unknown[]) =>
+    mockRevokeGoogleSignupAuthorization(...args),
   markGoogleSignupAttempt: (...args: unknown[]) =>
     mockMarkGoogleSignupAttempt(...args),
   retainGoogleSignupVisitor: (...args: unknown[]) =>
@@ -189,6 +284,19 @@ vi.mock("@/lib/auth/google-onboarding", () => ({
     mockEnsureGoogleOnboardingMembership(...args),
 }))
 
+const mockStrictPlans = vi.fn()
+const mockPricingVersion = vi.fn()
+vi.mock("@/lib/billing/plans-actions", () => ({
+  getPricingVersionAction: (...args: unknown[]) => mockPricingVersion(...args),
+  getPublicBillingPlansAction: (...args: unknown[]) => mockStrictPlans(...args),
+}))
+const mockUpdateSignupReview = vi.fn()
+vi.mock("@/lib/auth/signup-review-server", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("@/lib/auth/signup-review-server")>()),
+  updateSignupReviewMetadata: (...args: unknown[]) =>
+    mockUpdateSignupReview(...args),
+}))
+
 const mockTrackEvent = vi.fn()
 vi.mock("@/lib/posthog/actions", () => ({
   trackEvent: (...args: unknown[]) => mockTrackEvent(...args),
@@ -203,9 +311,11 @@ vi.mock("@/lib/posthog/events", () => ({
   },
 }))
 
+const mockSignOut = vi.fn()
 vi.mock("@/lib/supabase/server", () => ({
   createServerClient: async () => ({
     auth: {
+      signOut: (...args: unknown[]) => mockSignOut(...args),
       exchangeCodeForSession: async () => ({
         error: authExchangeError,
         data: {
@@ -227,6 +337,29 @@ import { GET } from "./route"
 describe("auth callback", () => {
   beforeEach(() => {
     vi.stubEnv("YC_STAFF_UI_ENABLED", "false")
+    mockGetSignupPlanAction.mockReset().mockResolvedValue(undefined)
+    mockPrepareTeam.mockReset().mockImplementation(async () => {
+      const team = { teamId: "created-team", region: "use" }
+      directoryState.memberships = [team]
+      return { team, apiKey: "server-only" }
+    })
+    mockReadSignupPlan
+      .mockReset()
+      .mockImplementation(
+        async (userId: string, team: { region: string; teamId: string }) => ({
+          userId,
+          teamKey: `${team.region}:${team.teamId}`,
+          state: "legacy",
+          offer: null,
+        }),
+      )
+    mockPricingVersion.mockReset().mockResolvedValue("legacy")
+    mockStrictPlans.mockReset().mockImplementation(async () => ({
+      pricing_version: await mockPricingVersion(),
+      cards: [],
+    }))
+    mockSignOut.mockReset().mockResolvedValue({ error: null })
+    mockUpdateSignupReview.mockReset().mockResolvedValue(undefined)
     evidenceJar.clear()
     currentUser = {
       id: "u1",
@@ -315,6 +448,7 @@ describe("auth callback", () => {
       .mockReset()
       .mockImplementation(async () => proofAvailable)
     mockConsumeGoogleSignupProof.mockReset()
+    mockRevokeGoogleSignupAuthorization.mockReset().mockResolvedValue(undefined)
     mockMarkGoogleSignupAttempt.mockReset().mockResolvedValue(undefined)
     mockRetainOriginalGoogleSignup.mockReset().mockResolvedValue(undefined)
     mockRequireGoogleSignupProof.mockReset()
@@ -682,7 +816,9 @@ describe("auth callback", () => {
           `https://console.superserve.ai/auth/callback?code=abc&signup_attempt_id=attempt-1&offer=${offer}`,
         ),
       )
-      expect(response.headers.get("location")).toContain("/sandboxes")
+      expect(response.headers.get("location")).toContain(
+        offer === "pro_annual" ? "/billing/pro/" : "/sandboxes",
+      )
       const offerCookie = response.cookies.get("ss-plan-offer")
       if (expected)
         expect(JSON.parse(offerCookie!.value)).toEqual({
@@ -795,6 +931,24 @@ describe("auth callback", () => {
     )
   })
 
+  it("retains Pro recovery markers through OAuth without accepting a claimed paid state", async () => {
+    const next =
+      "/billing/pro/?billing=success&team=use%3Aoriginal&return=%2Fsandboxes"
+    const response = await GET(
+      new Request(
+        `https://console.superserve.ai/auth/callback?code=abc&next=${encodeURIComponent(next)}`,
+      ),
+    )
+    const destination = new URL(response.headers.get("location")!)
+    expect(destination.pathname + destination.search).toBe(next)
+    const forged = await GET(
+      new Request(
+        `https://console.superserve.ai/auth/callback?code=abc&next=${encodeURIComponent("/billing/pro/?approved=true")}`,
+      ),
+    )
+    expect(new URL(forged.headers.get("location")!).pathname).toBe("/sandboxes")
+  })
+
   it("preserves checkout account and team through OAuth reauthentication", async () => {
     const next =
       "/onboarding/plan/?team=use%3Aoriginal&account=u1&billing=success"
@@ -825,6 +979,888 @@ describe("auth callback", () => {
     )
     expect(mockNotifySlackOfNewUser).not.toHaveBeenCalled()
     expect(response.cookies.get("ss-plan-offer")?.value).toBe("")
+  })
+
+  describe("pricing v2 signup", () => {
+    const firstTimeGoogle = (offer: string) => {
+      googleMembershipState = { kind: "first_time" }
+      mockHasValidGoogleSignupProof.mockResolvedValue(true)
+      return GET(
+        new Request(
+          `https://console.superserve.ai/auth/callback?code=abc&signup_attempt_id=attempt-1&signup_offer=${offer}`,
+        ),
+      )
+    }
+
+    it("keeps today's signup when the switch is off, whatever the offer", async () => {
+      const response = await firstTimeGoogle("enterprise")
+
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockSignOut).not.toHaveBeenCalled()
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/sandboxes",
+      )
+      expect(mockSendWelcomeEmail).toHaveBeenCalled()
+      expect(mockNotifySlackOfNewUser).toHaveBeenCalledWith(
+        "user@example.com",
+        "Test User",
+        "google",
+        { kind: "unavailable" },
+        undefined,
+      )
+    })
+
+    it("keeps a v2 offer through the Google signup recovery page", async () => {
+      googleMembershipState = { kind: "first_time" }
+      proofAvailable = false
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&google_signin_intent=pre-auth-intent&signup_offer=enterprise",
+        ),
+      )
+      const location = new URL(response.headers.get("location")!)
+      expect(location.searchParams.get("complete_google")).toBe("1")
+      expect(location.searchParams.get("signup_offer")).toBe("enterprise")
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+    })
+
+    it("signs out and reports an error when the Enterprise hold can't be recorded", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+      mockUpdateSignupReview.mockRejectedValue(new Error("auth down"))
+
+      const response = await firstTimeGoogle("enterprise")
+
+      expect(mockMarkGoogleSignupAttempt).not.toHaveBeenCalled()
+      expect(mockRevokeGoogleSignupAuthorization).toHaveBeenCalledWith(
+        "u1",
+        "attempt-1",
+      )
+      expect(mockSignOut).toHaveBeenCalled()
+      expect(mockSendWelcomeEmail).not.toHaveBeenCalled()
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/auth/auth-code-error",
+      )
+    })
+
+    it("revokes provisioning proof when recording the Enterprise hold fails", async () => {
+      const proofs = await vi.importActual<
+        typeof import("@/lib/auth/google-signup-proof")
+      >("@/lib/auth/google-signup-proof")
+      const previousSecret = process.env.GOOGLE_SIGNUP_PROOF_SECRET
+      process.env.GOOGLE_SIGNUP_PROOF_SECRET =
+        "a-secret-with-at-least-thirty-two-characters"
+      try {
+        await proofs.issueGoogleSignupProof("attempt-1")
+        mockHasValidGoogleSignupProof.mockImplementation(
+          proofs.hasValidGoogleSignupProof,
+        )
+        mockMarkGoogleSignupAttempt.mockImplementation(
+          proofs.markGoogleSignupAttempt,
+        )
+        mockRevokeGoogleSignupAuthorization.mockImplementation(
+          proofs.revokeGoogleSignupAuthorization,
+        )
+        mockPricingVersion.mockResolvedValue("v2")
+        mockUpdateSignupReview.mockRejectedValue(new Error("auth down"))
+        await firstTimeGoogle("enterprise")
+        await expect(proofs.requireGoogleSignupProof("u1")).rejects.toThrow()
+        expect(mockMarkGoogleSignupAttempt).not.toHaveBeenCalled()
+        expect(mockSignOut).toHaveBeenCalled()
+      } finally {
+        if (previousSecret === undefined)
+          delete process.env.GOOGLE_SIGNUP_PROOF_SECRET
+        else process.env.GOOGLE_SIGNUP_PROOF_SECRET = previousSecret
+      }
+    })
+
+    it("keeps selected Starter navigation when catalog entry is unavailable", async () => {
+      mockPricingVersion.mockResolvedValue("legacy")
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_offer=starter",
+        ),
+      )
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/plan-usage/buy-credit",
+      )
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+    })
+
+    it.each(["code=abc", "token_hash=token&type=signup"])(
+      "fails closed before Enterprise provisioning if current pricing cannot be read: %s",
+      async (proof) => {
+        googleMembershipState = { kind: "first_time" }
+        mockStrictPlans.mockRejectedValue(new Error("Pricing unavailable"))
+        const response = await GET(
+          new Request(
+            `https://console.superserve.ai/auth/callback?${proof}&signup_offer=enterprise`,
+          ),
+        )
+        expect(
+          new URL(response.headers.get("location")!).searchParams.get("reason"),
+        ).toBe("pricing_unavailable")
+        expect(mockSignOut).toHaveBeenCalled()
+        expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+        if (proof.startsWith("code="))
+          expect(mockUpdateSignupReview).toHaveBeenCalledWith("u1", {
+            signup_enterprise_pricing_pending: true,
+          })
+        else expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+        expect(mockSendWelcomeEmail).not.toHaveBeenCalled()
+      },
+    )
+
+    it("carries Enterprise through the rendered error retry, Google sign-in and callback recovery", async () => {
+      googleMembershipState = { kind: "first_time" }
+      mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+      mockUpdateSignupReview.mockImplementation(async (_id, metadata) =>
+        Object.assign(currentUser!.app_metadata, metadata),
+      )
+      const failed = await firstTimeGoogle("enterprise")
+      retrySearch = new URL(failed.headers.get("location")!).searchParams
+      const ErrorPage = (await import("../auth-code-error/page")).default
+      render(createElement(ErrorPage))
+      const retry = new URL(
+        screen.getByRole("link", { name: "Try Again" }).getAttribute("href")!,
+        "https://console.superserve.ai",
+      )
+      expect(retry.pathname).toBe("/auth/signin")
+      cleanup()
+      retrySearch = retry.searchParams
+      mockRetryOAuth.mockResolvedValue({ error: null })
+      const SignInPage = (await import("../signin/page")).default
+      render(createElement(SignInPage))
+      await userEvent.click(
+        screen.getByRole("button", { name: "Continue with Google" }),
+      )
+      await waitFor(() => expect(mockRetryOAuth).toHaveBeenCalled())
+      const callback = new URL(
+        mockRetryOAuth.mock.lastCall![0].options.redirectTo,
+      )
+      expect(callback.searchParams.get("signup_offer")).toBe("enterprise")
+      callback.searchParams.set("code", "retry")
+      mockStrictPlans.mockResolvedValue({ pricing_version: "v2", cards: [] })
+      const recovered = await GET(new Request(callback))
+      expect(new URL(recovered.headers.get("location")!).pathname).toBe(
+        "/auth/pending",
+      )
+      expect(currentUser!.app_metadata.signup_review).toBe("pending")
+      expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+      expect(mockSendWelcomeEmail).not.toHaveBeenCalled()
+      cleanup()
+    })
+
+    it.each(["approved", "pending", "rejected"])(
+      "does not change a real %s review on Enterprise retry",
+      async (status) => {
+        googleMembershipState = { kind: "first_time" }
+        currentUser!.app_metadata.signup_review = status
+        mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+        await GET(
+          new Request(
+            "https://console.superserve.ai/auth/callback?code=abc&signup_offer=enterprise",
+          ),
+        )
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+        expect(currentUser!.app_metadata.signup_review).toBe(status)
+      },
+    )
+
+    it("revokes signup authorization and never provisions if saving unresolved classification fails", async () => {
+      googleMembershipState = { kind: "first_time" }
+      mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+      mockUpdateSignupReview.mockRejectedValue(new Error("auth write down"))
+      await firstTimeGoogle("enterprise")
+      expect(mockRevokeGoogleSignupAuthorization).toHaveBeenCalledWith(
+        "u1",
+        "attempt-1",
+      )
+      expect(mockSignOut).toHaveBeenCalled()
+      expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+    })
+
+    it.each(["v2", "legacy"])(
+      "retains first-time Enterprise classification without a retry URL, resolving %s authoritatively",
+      async (pricing) => {
+        googleMembershipState = { kind: "first_time" }
+        mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+        mockUpdateSignupReview.mockImplementation(async (_id, metadata) => {
+          Object.assign(currentUser!.app_metadata, metadata)
+        })
+        const failed = await firstTimeGoogle("enterprise")
+        const failure = new URL(failed.headers.get("location")!)
+        expect(failure.searchParams.get("signup_offer")).toBe("enterprise")
+        expect(
+          currentUser!.app_metadata.signup_enterprise_pricing_pending,
+        ).toBe(true)
+        expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+        mockStrictPlans.mockResolvedValue({
+          pricing_version: pricing,
+          cards: [],
+        })
+        const retry = await GET(
+          new Request(
+            "https://console.superserve.ai/auth/callback?code=retry&signup_attempt_id=attempt-1",
+          ),
+        )
+        expect(
+          currentUser!.app_metadata.signup_enterprise_pricing_pending,
+        ).toBe(false)
+        if (pricing === "v2") {
+          expect(currentUser!.app_metadata.signup_review).toBe("pending")
+          expect(new URL(retry.headers.get("location")!).pathname).toBe(
+            "/auth/pending",
+          )
+          expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+        } else {
+          expect(currentUser!.app_metadata.signup_review).toBeUndefined()
+          expect(new URL(retry.headers.get("location")!).pathname).toBe(
+            "/sandboxes",
+          )
+        }
+      },
+    )
+
+    it.each([undefined, "approved"])(
+      "lets proven existing Google customers sign in during Enterprise catalog failure (%s)",
+      async (status) => {
+        currentUser!.app_metadata.signup_review = status
+        mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+        const response = await GET(
+          new Request(
+            "https://console.superserve.ai/auth/callback?code=abc&signup_offer=enterprise",
+          ),
+        )
+        expect(new URL(response.headers.get("location")!).pathname).toBe(
+          "/sandboxes",
+        )
+        expect(mockSignOut).not.toHaveBeenCalled()
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+        expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+        expect(mockPricingVersion).not.toHaveBeenCalled()
+        expect(currentUser!.app_metadata.signup_review).toBe(status)
+      },
+    )
+
+    it.each(["pending", "rejected"])(
+      "never bypasses an existing customer's real %s hold during catalog failure",
+      async (status) => {
+        currentUser!.app_metadata.signup_review = status
+        mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+        const response = await GET(
+          new Request(
+            "https://console.superserve.ai/auth/callback?code=abc&signup_offer=enterprise",
+          ),
+        )
+        expect(new URL(response.headers.get("location")!).pathname).toBe(
+          "/auth/pending",
+        )
+        expect(mockSignOut).toHaveBeenCalled()
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+        expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+      },
+    )
+
+    it("does not use a partially degraded existing directory to bypass Enterprise admission", async () => {
+      directoryState.degradedRegions = ["euw"]
+      mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_offer=enterprise",
+        ),
+      )
+      expect(
+        new URL(response.headers.get("location")!).searchParams.get("reason"),
+      ).toBe("pricing_unavailable")
+      expect(mockSignOut).toHaveBeenCalled()
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+    })
+
+    it("does not admit degraded membership reads during Enterprise catalog failure", async () => {
+      googleMembershipState = {
+        kind: "indeterminate",
+        degradedRegions: ["use"],
+      }
+      mockStrictPlans.mockRejectedValue(new Error("catalog down"))
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_offer=enterprise",
+        ),
+      )
+      expect(
+        new URL(response.headers.get("location")!).searchParams.get("reason"),
+      ).toBe("pricing_unavailable")
+      expect(mockSignOut).toHaveBeenCalled()
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockEnsureGoogleOnboardingMembership).not.toHaveBeenCalled()
+    })
+
+    it("retains explicit legacy Enterprise email confirmation without inventing a hold", async () => {
+      mockStrictPlans.mockResolvedValue({
+        pricing_version: "legacy",
+        cards: [],
+      })
+      currentUser!.app_metadata = { provider: "email" }
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?token_hash=token&type=signup&signup_offer=enterprise",
+        ),
+      )
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/sandboxes",
+      )
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(mockSignOut).not.toHaveBeenCalled()
+    })
+
+    it("does not ask for the switch without an offer", async () => {
+      googleMembershipState = { kind: "first_time" }
+      mockHasValidGoogleSignupProof.mockResolvedValue(true)
+      await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_attempt_id=attempt-1",
+        ),
+      )
+      expect(mockPricingVersion).not.toHaveBeenCalled()
+    })
+
+    it("holds a new Enterprise account without access", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+
+      const response = await firstTimeGoogle("enterprise")
+
+      expect(mockUpdateSignupReview).toHaveBeenCalledWith("u1", {
+        signup_review: "pending",
+      })
+      expect(mockUpdateSignupReview.mock.invocationCallOrder[0]).toBeLessThan(
+        mockMarkGoogleSignupAttempt.mock.invocationCallOrder[0],
+      )
+      expect(
+        mockMarkGoogleSignupAttempt.mock.invocationCallOrder[0],
+      ).toBeLessThan(
+        mockReadGooglePromotionEvidence.mock.invocationCallOrder[0],
+      )
+      expect(mockSignOut).toHaveBeenCalled()
+      expect(mockSendWelcomeEmail).not.toHaveBeenCalled()
+      expect(mockNotifySlackOfNewUser).toHaveBeenCalledWith(
+        "user@example.com",
+        "Test User",
+        "google",
+        { kind: "unavailable" },
+        undefined,
+        true,
+      )
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/auth/pending",
+      )
+    })
+
+    it.each([
+      ["free", "/sandboxes"],
+      ["starter", "/plan-usage/buy-credit"],
+      ["pro", "/billing/pro/"],
+      ["pro_monthly", "/billing/pro/"],
+      ["pro_annual", "/billing/pro/"],
+      ["retired_offer", "/billing/pro/"],
+    ])("routes a new %s signup to %s", async (offer, destination) => {
+      mockPricingVersion.mockResolvedValue("v2")
+
+      const response = await firstTimeGoogle(offer)
+
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        destination,
+      )
+    })
+
+    it.each(["v2", "legacy"])(
+      "keeps recognized aliases through OAuth and email confirmation under %s entry",
+      async (version) => {
+        mockPricingVersion.mockResolvedValue(version)
+        for (const [offer, destination] of [
+          ["starter_monthly", "/plan-usage/buy-credit"],
+          ["pro_annual", "/billing/pro/"],
+        ]) {
+          for (const proof of ["code=abc", "token_hash=token&type=signup"]) {
+            const response = await GET(
+              new Request(
+                `https://console.superserve.ai/auth/callback?${proof}&signup_offer=${offer}`,
+              ),
+            )
+            expect(new URL(response.headers.get("location")!).pathname).toBe(
+              destination,
+            )
+          }
+        }
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each([
+      "/billing/pro/?team=use%3Ateam&return=%2Fsandboxes",
+      "/plan-usage/buy-credit?amount=500",
+    ])(
+      "keeps direct no-offer email confirmation destination %s",
+      async (next) => {
+        const url = new URL(
+          "https://console.superserve.ai/auth/callback?token_hash=abc123&type=signup",
+        )
+        url.searchParams.set("next", next)
+        const response = await GET(new Request(url))
+        const location = new URL(response.headers.get("location")!)
+        expect(location.pathname + location.search).toBe(next)
+        expect(mockPricingVersion).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each([
+      ["starter", "/plan-usage/buy-credit/"],
+      ["pro_monthly", "/billing/pro/"],
+    ])(
+      "finishes first-team preparation before the fresh %s confirmation destination",
+      async (offer, next) => {
+        currentUser!.app_metadata = { provider: "email" }
+        const action = await vi.importActual<
+          typeof import("@/lib/api/signup-plan-actions")
+        >("@/lib/api/signup-plan-actions")
+        const { getSignupPlanPage } = await import("@/lib/api/signup-plan-page")
+        mockGetSignupPlanAction.mockImplementation(action.getSignupPlanAction)
+        const read = await vi.importActual<
+          typeof import("@/lib/api/signup-plan-read")
+        >("@/lib/api/signup-plan-read")
+        mockReadSignupPlan.mockImplementation(read.readSignupPlan)
+        const originalCell = mockCellFor.getMockImplementation()!
+        mockCellFor.mockImplementation((...args: unknown[]) => {
+          const original = originalCell(...args)
+          return {
+            ...original,
+            createAdminClient: () => {
+              const admin = original.createAdminClient()
+              return {
+                ...admin,
+                from: (table: string) => {
+                  if (table === "billing_signup_choice")
+                    return {
+                      select: () => ({
+                        eq: () => ({
+                          maybeSingle: async () => ({
+                            data: { state: "selecting", offer_key: null },
+                            error: null,
+                          }),
+                        }),
+                      }),
+                    }
+                  if (table === "team_plan_assignment")
+                    return {
+                      select: () => ({
+                        eq: () => ({
+                          lte: () => ({
+                            or: () => ({
+                              limit: async () => ({
+                                data: directoryState.memberships.length
+                                  ? [{ id: "initial-free-assignment" }]
+                                  : [],
+                                error: null,
+                              }),
+                            }),
+                          }),
+                        }),
+                      }),
+                    }
+                  return admin.from(table)
+                },
+              }
+            },
+          }
+        })
+        // This is the dashboard's real no-membership branch. Before the fix it
+        // replaced the selected payment page with generic plan setup/sandboxes.
+        await expect(getSignupPlanPage()).rejects.toThrow(
+          "/api/onboarding/prepare/",
+        )
+        const url = new URL(
+          "https://console.superserve.ai/auth/callback?token_hash=official&type=signup",
+        )
+        url.searchParams.set("offer", offer)
+        url.searchParams.set("signup_offer", offer)
+        url.searchParams.set("next", next)
+        const response = await GET(new Request(url))
+        expect(new URL(response.headers.get("location")!).pathname).toBe(next)
+        expect(mockPrepareTeam).toHaveBeenCalledWith(
+          currentUser,
+          expect.any(String),
+        )
+        expect(mockGetSignupPlanAction).toHaveBeenCalledWith(
+          undefined,
+          "u1",
+          undefined,
+          next,
+        )
+        // The real destination dashboard context now resolves the created Free
+        // team's legacy picker exemption; no preparation or plan-picker detour.
+        const page = await getSignupPlanPage()
+        expect(page?.context.teamKey).toBe("use:created-team")
+        expect(page?.context.state).toBe("legacy")
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      },
+    )
+
+    it("retains the paid continuation and actor when first-team preparation fails", async () => {
+      currentUser!.app_metadata = { provider: "email" }
+      mockGetSignupPlanAction.mockRejectedValueOnce(new Error("Response lost"))
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?token_hash=official&type=signup&signup_offer=starter&next=%2Fplan-usage%2Fbuy-credit%2F",
+        ),
+      )
+      const location = new URL(response.headers.get("location")!)
+      expect(location.pathname).toBe("/auth/auth-code-error")
+      expect(location.searchParams.get("reason")).toBe("account_setup")
+      expect(location.searchParams.get("next")).toBe("/plan-usage/buy-credit/")
+      expect(location.searchParams.get("account")).toBe("u1")
+    })
+
+    it("retries a failed first-team confirmation through expired-session reauthentication without losing Starter", async () => {
+      currentUser!.app_metadata = { provider: "email" }
+      const owner = currentUser!
+      const action = await vi.importActual<
+        typeof import("@/lib/api/signup-plan-actions")
+      >("@/lib/api/signup-plan-actions")
+      const { GET: prepare } =
+        await import("@/app/api/onboarding/prepare/route")
+      mockGetSignupPlanAction.mockImplementation(action.getSignupPlanAction)
+      mockPrepareTeam.mockRejectedValueOnce(
+        new Error("Provision response lost"),
+      )
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?token_hash=official&type=signup&signup_offer=starter&next=%2Fplan-usage%2Fbuy-credit%2F",
+        ),
+      )
+      const recovery = new URL(response.headers.get("location")!)
+      expect(recovery.searchParams.get("reason")).toBe("account_setup")
+      const retry = new URL("/api/onboarding/prepare/", recovery)
+      retry.searchParams.set("account", recovery.searchParams.get("account")!)
+      retry.searchParams.set("next", recovery.searchParams.get("next")!)
+      currentUser = null
+      const signin = await prepare(new Request(retry)).catch(
+        (error) => new URL(error.message, retry),
+      )
+      if (!signin) throw new Error("Expected reauthentication")
+      expect(signin.pathname).toBe("/auth/signin")
+      const authenticatedNext = signin.searchParams.get("next")!
+      expect(new URL(authenticatedNext, signin).searchParams.get("next")).toBe(
+        "/plan-usage/buy-credit/",
+      )
+      currentUser = owner
+      const callback = new URL(
+        "https://console.superserve.ai/auth/callback?token_hash=renewed&type=magiclink",
+      )
+      callback.searchParams.set("next", authenticatedNext)
+      const authenticated = await GET(new Request(callback))
+      const prepared = await prepare(
+        new Request(authenticated.headers.get("location")!),
+      ).catch((error) => new URL(error.message, retry))
+      if (!prepared) throw new Error("Expected paid destination")
+      expect(prepared.pathname).toBe("/plan-usage/buy-credit/")
+      expect(directoryState.memberships).toEqual([
+        { teamId: "created-team", region: "use" },
+      ])
+    })
+
+    it.each(["starter", "pro_monthly"])(
+      "renders an account-bound %s retry after the earlier email directory read degrades",
+      async (offer) => {
+        currentUser!.app_metadata = { provider: "email" }
+        directoryState = { memberships: [], degradedRegions: ["use"] }
+        const next =
+          offer === "starter" ? "/plan-usage/buy-credit/" : "/billing/pro/"
+        const url = new URL(
+          "https://console.superserve.ai/auth/callback?token_hash=official&type=signup",
+        )
+        url.searchParams.set("signup_offer", offer)
+        url.searchParams.set("next", next)
+        const response = await GET(new Request(url))
+        const failure = new URL(response.headers.get("location")!)
+        expect(mockGetSignupPlanAction).not.toHaveBeenCalled()
+        retrySearch = failure.searchParams
+        const ErrorPage = (await import("../auth-code-error/page")).default
+        render(createElement(ErrorPage))
+        const retry = new URL(
+          screen.getByRole("link", { name: "Try Again" }).getAttribute("href")!,
+          url,
+        )
+        cleanup()
+        expect(retry.pathname).toBe("/api/onboarding/prepare/")
+        expect(retry.searchParams.get("next")).toBe(next)
+        expect(retry.searchParams.get("account")).toBe("u1")
+        expect(mockEvaluateSignupRestriction).not.toHaveBeenCalled()
+        // A fresh retry still uses the existing verified-account setup action;
+        // this redirect is navigation, not membership or payment authorization.
+      },
+    )
+
+    it.each(["starter", "pro_monthly"])(
+      "preserves default %s offer intent when the email directory read throws",
+      async (offer) => {
+        currentUser!.app_metadata = { provider: "email" }
+        mockListTeamMembershipsForUserDetailed.mockRejectedValueOnce(
+          new Error("Directory unavailable"),
+        )
+        const response = await GET(
+          new Request(
+            `https://console.superserve.ai/auth/callback?token_hash=official&type=signup&signup_offer=${offer}`,
+          ),
+        )
+        const failure = new URL(response.headers.get("location")!)
+        expect(failure.searchParams.get("reason")).toBe("account_setup")
+        expect(failure.searchParams.get("account")).toBe("u1")
+        expect(failure.searchParams.get("next")).toBe(
+          offer === "starter" ? "/plan-usage/buy-credit" : "/billing/pro/",
+        )
+        expect(mockGetSignupPlanAction).not.toHaveBeenCalled()
+      },
+    )
+
+    it("retains the existing preparation account and pinned team on a degraded Google lookup", async () => {
+      googleMembershipState = {
+        kind: "indeterminate",
+        degradedRegions: ["use"],
+      }
+      const preparation =
+        "/api/onboarding/prepare/?account=original&team=use%3Aoriginal-team&next=%2Fbilling%2Fpro%2F"
+      const url = new URL(
+        "https://console.superserve.ai/auth/callback?code=abc",
+      )
+      url.searchParams.set("next", preparation)
+      const response = await GET(new Request(url))
+      const failure = new URL(response.headers.get("location")!)
+      expect(failure.pathname).toBe("/auth/signup")
+      expect(failure.searchParams.get("complete_google")).toBe("1")
+      const savedPreparation = new URL(failure.searchParams.get("next")!, url)
+      expect(savedPreparation.pathname).toBe("/api/onboarding/prepare/")
+      expect(savedPreparation.searchParams.get("account")).toBe("original")
+      const paid = new URL(savedPreparation.searchParams.get("next")!, url)
+      expect(paid.pathname).toBe("/billing/pro/")
+      expect(paid.searchParams.get("team")).toBe("use:original-team")
+      expect(mockGetSignupPlanAction).not.toHaveBeenCalled()
+      expect(mockMarkGoogleSignupAttempt).not.toHaveBeenCalled()
+    })
+
+    it("sends a real unbound Google proof through completion rather than looping first-team preparation", async () => {
+      vi.stubEnv(
+        "GOOGLE_SIGNUP_PROOF_SECRET",
+        "test-google-proof-secret-at-least-32-characters",
+      )
+      const proof = await vi.importActual<
+        typeof import("@/lib/auth/google-signup-proof")
+      >("@/lib/auth/google-signup-proof")
+      await proof.issueGoogleSignupProof("early-unbound-attempt")
+      const before = [...evidenceJar]
+      googleMembershipState = {
+        kind: "indeterminate",
+        degradedRegions: ["use"],
+      }
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_attempt_id=early-unbound-attempt&signup_offer=starter&next=%2Fplan-usage%2Fbuy-credit%2F",
+        ),
+      )
+      const recovery = new URL(response.headers.get("location")!)
+      expect(recovery.pathname).toBe("/auth/signup")
+      expect(recovery.searchParams.get("complete_google")).toBe("1")
+      const preparation = new URL(recovery.searchParams.get("next")!, recovery)
+      expect(preparation.searchParams.get("account")).toBe("u1")
+      expect(preparation.searchParams.get("next")).toBe(
+        "/plan-usage/buy-credit/",
+      )
+      expect([...evidenceJar]).toEqual(before)
+      expect(mockMarkGoogleSignupAttempt).not.toHaveBeenCalled()
+      expect(mockGetSignupPlanAction).not.toHaveBeenCalled()
+      // This real guard cannot use an unbound scoped proof without completion.
+      // After that gate binds the proof, the same actor's guard succeeds.
+      await expect(proof.requireGoogleSignupProof("u1")).rejects.toThrow(
+        "Google signup verification required",
+      )
+      await proof.markGoogleSignupAttempt("early-unbound-attempt", "u1")
+      await expect(proof.requireGoogleSignupProof("u1")).resolves.toBe(
+        "early-unbound-attempt",
+      )
+    })
+
+    it.each(["https://evil.test", "//evil.test", "/billing/pro?approved=true"])(
+      "does not turn unsafe next into a paid retry on degraded lookup: %s",
+      async (next) => {
+        currentUser!.app_metadata = { provider: "email" }
+        directoryState = { memberships: [], degradedRegions: ["use"] }
+        const url = new URL(
+          "https://console.superserve.ai/auth/callback?token_hash=official&type=signup&signup_offer=starter",
+        )
+        url.searchParams.set("next", next)
+        const response = await GET(new Request(url))
+        const failure = new URL(response.headers.get("location")!)
+        expect(failure.searchParams.get("reason")).toBe(
+          "membership_lookup_degraded",
+        )
+        expect(failure.searchParams.get("account")).toBeNull()
+        expect(failure.searchParams.get("next")).toBeNull()
+      },
+    )
+
+    it("keeps Enterprise directory degradation out of self-serve preparation", async () => {
+      mockStrictPlans.mockResolvedValue({ pricing_version: "v2", cards: [] })
+      googleMembershipState = {
+        kind: "indeterminate",
+        degradedRegions: ["use"],
+      }
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_offer=enterprise&next=%2Fbilling%2Fpro%2F",
+        ),
+      )
+      const failure = new URL(response.headers.get("location")!)
+      expect(failure.searchParams.get("reason")).toBe(
+        "membership_lookup_degraded",
+      )
+      expect(failure.searchParams.get("next")).toBeNull()
+      expect(mockGetSignupPlanAction).not.toHaveBeenCalled()
+      expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+    })
+
+    it("keeps an outer-only team pin through the real handler, rendered recovery, and retry", async () => {
+      const action = await vi.importActual<
+        typeof import("@/lib/api/signup-plan-actions")
+      >("@/lib/api/signup-plan-actions")
+      const read = await vi.importActual<
+        typeof import("@/lib/api/signup-plan-read")
+      >("@/lib/api/signup-plan-read")
+      const { GET: prepare } =
+        await import("@/app/api/onboarding/prepare/route")
+      mockGetSignupPlanAction.mockImplementation(action.getSignupPlanAction)
+      mockReadSignupPlan.mockImplementation(read.readSignupPlan)
+      const request = new Request(
+        "https://console.superserve.ai/api/onboarding/prepare/?account=u1&team=use%3Aoriginal-team&next=%2Fbilling%2Fpro%2F",
+      )
+      const failure = await prepare(request).catch(
+        (error) => new URL(error.message, request.url),
+      )
+      if (!failure) throw new Error("Expected team recovery")
+      expect(failure.searchParams.get("reason")).toBe("team_changed")
+      retrySearch = failure.searchParams
+      const ErrorPage = (await import("../auth-code-error/page")).default
+      render(createElement(ErrorPage))
+      const retry = new URL(
+        screen
+          .getByRole("link", {
+            name: "Continue after selecting the original team",
+          })
+          .getAttribute("href")!,
+        request.url,
+      )
+      cleanup()
+      const paid = new URL(retry.searchParams.get("next")!, retry)
+      expect(paid.searchParams.get("team")).toBe("use:original-team")
+      // The currently selected created-team must still be rejected; recovery
+      // cannot silently retarget the original checkout to that different team.
+      const again = await prepare(new Request(retry)).catch(
+        (error) => new URL(error.message, retry),
+      )
+      if (!again) throw new Error("Expected binding to remain blocked")
+      expect(again.searchParams.get("reason")).toBe("team_changed")
+      expect(mockGetSignupPlanAction).toHaveBeenLastCalledWith(
+        "use:original-team",
+        "u1",
+        undefined,
+        "/billing/pro/?team=use%3Aoriginal-team",
+      )
+    })
+
+    it("keeps an account-bound paid preparation return through reauthentication", async () => {
+      currentUser!.app_metadata = { provider: "email" }
+      const next =
+        "/api/onboarding/prepare/?account=u1&next=%2Fbilling%2Fpro%2F"
+      const url = new URL(
+        "https://console.superserve.ai/auth/callback?token_hash=official&type=magiclink",
+      )
+      url.searchParams.set("next", next)
+      const response = await GET(new Request(url))
+      const destination = new URL(response.headers.get("location")!)
+      expect(destination.pathname + destination.search).toBe(next)
+      expect(mockGetSignupPlanAction).not.toHaveBeenCalled()
+    })
+
+    it("routes by the legacy offer parameter when no v2 offer was sent", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+      currentUser!.app_metadata = { provider: "email" }
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?token_hash=token&type=signup&offer=pro_monthly",
+        ),
+      )
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/billing/pro/",
+      )
+    })
+
+    it("routes an existing customer to the selected Starter purchase", async () => {
+      mockPricingVersion.mockResolvedValue("v2")
+      const response = await GET(
+        new Request(
+          "https://console.superserve.ai/auth/callback?code=abc&signup_offer=starter",
+        ),
+      )
+      expect(new URL(response.headers.get("location")!).pathname).toBe(
+        "/plan-usage/buy-credit",
+      )
+    })
+
+    it.each([
+      ["offer=pro_monthly", "/billing/pro/"],
+      ["offer=free", "/sandboxes"],
+      ["signup_offer=enterprise", "/sandboxes"],
+      [
+        "signup_offer=starter&next=%2Fbilling%2Fpro%3Fbilling%3Dsuccess%26team%3Duse%253Aoriginal",
+        "/billing/pro",
+      ],
+      [
+        "signup_offer=pro_monthly&next=%2Fplan-usage%2Fbuy-credit%3Fpurchase%3Dsuccess%26team%3Duse%253Aoriginal",
+        "/plan-usage/buy-credit",
+      ],
+    ])(
+      "preserves existing account intent or explicit payment return: %s",
+      async (query, path) => {
+        mockPricingVersion.mockResolvedValue("v2")
+        const response = await GET(
+          new Request(
+            `https://console.superserve.ai/auth/callback?code=abc&${query}`,
+          ),
+        )
+        const location = new URL(response.headers.get("location")!)
+        expect(location.pathname).toBe(path)
+        if (query.includes("next="))
+          expect(location.searchParams.get("team")).toBe("use:original")
+        expect(mockUpdateSignupReview).not.toHaveBeenCalled()
+      },
+    )
+
+    it.each(["pending", "rejected"])(
+      "signs a %s account out before any onboarding work",
+      async (status) => {
+        currentUser!.app_metadata = { provider: "email", signup_review: status }
+        const response = await GET(
+          new Request(
+            "https://console.superserve.ai/auth/callback?token_hash=token&type=signup",
+          ),
+        )
+        expect(mockSignOut).toHaveBeenCalled()
+        expect(mockEvaluateSignupRestriction).not.toHaveBeenCalled()
+        expect(mockSendWelcomeEmail).not.toHaveBeenCalled()
+        expect(new URL(response.headers.get("location")!).pathname).toBe(
+          "/auth/pending",
+        )
+      },
+    )
   })
 
   it("lets a first-time Google user through when proof is valid", async () => {
@@ -1564,7 +2600,7 @@ describe("auth callback", () => {
       mockNotifySlackOfNewUser.mockClear()
       const response = await GET(new Request(confirmationUrl))
       expect(mockNotifySlackOfNewUser.mock.lastCall![4]).toBe("pro_monthly")
-      expect(response.headers.get("location")).toContain("/sandboxes")
+      expect(response.headers.get("location")).toContain("/billing/pro/")
       expect(mockEvaluateSignupRestriction).toHaveBeenCalledExactlyOnceWith(
         "use",
         "u1",

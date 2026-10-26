@@ -14,7 +14,9 @@ export async function getPublicBillingPlansAction(
   const cell = cellFor(region)
   const response = await fetch(
     new URL("/billing/plans/public", cell.apiBaseUrl),
-    { next: { revalidate: 60 }, signal: AbortSignal.timeout(2000) },
+    // Pricing publication and entry gates are mutable; avoid serving a cached
+    // rollout decision while retaining regional routing and the bounded read.
+    { cache: "no-store", signal: AbortSignal.timeout(2000) },
   )
   if (!response.ok) throw new Error("Plans are unavailable")
   return publicBillingPlansSchema.parse(await response.json())
