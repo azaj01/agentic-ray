@@ -1,3 +1,17 @@
+vi.mock("@/hooks/use-billing-capabilities", () => ({
+  useBillingCapabilities: () => ({
+    data: {
+      pricing_version: useTeamPlan().data ? "v2" : "legacy",
+      entry_open: !!useTeamPlan().data,
+      fresh_entry: {
+        starter: !!useTeamPlan().data,
+        pro: !!useTeamPlan().data,
+        auto_recharge: false,
+        choose_free: false,
+      },
+    },
+  }),
+}))
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { fireEvent, render, screen, within } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -438,8 +452,12 @@ describe("PlanUsagePage", () => {
       },
     })
     renderPage()
-    expect(screen.getByText("Current plan")).toBeInTheDocument()
-    expect(screen.getByText("Free")).toBeInTheDocument()
+    expect(
+      screen.getByRole("region", { name: "Usage and balance" }),
+    ).toBeInTheDocument()
+    expect(screen.getByText("Usage limits")).toBeInTheDocument()
+    expect(screen.queryByText("Current plan")).not.toBeInTheDocument()
+    expect(screen.queryByText("Free")).not.toBeInTheDocument()
     expect(screen.getByRole("link", { name: "Upgrade" })).toBeInTheDocument()
     expect(
       screen.queryByText(
@@ -482,7 +500,7 @@ describe("PlanUsagePage", () => {
   })
 
   it("shows a not-charged indicator for shadow usage", () => {
-    const summaryQuery = useBillingSummary.mock.results[0]?.value
+    const summaryQuery = useBillingSummary()
     useBillingSummary.mockReturnValue({
       ...summaryQuery,
       data: { ...summaryQuery.data, billing_mode: "shadow" },

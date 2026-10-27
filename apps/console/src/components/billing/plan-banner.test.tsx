@@ -1,3 +1,19 @@
+vi.mock("@/hooks/use-billing-capabilities", () => ({
+  useBillingCapabilities: () => ({
+    data: mocks.capabilityUnavailable
+      ? undefined
+      : {
+          pricing_version: "v2",
+          entry_open: true,
+          fresh_entry: {
+            starter: mocks.buyCredit,
+            pro: mocks.buyCredit,
+            auto_recharge: mocks.recharge,
+            choose_free: true,
+          },
+        },
+  }),
+}))
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { render, screen } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
@@ -5,6 +21,9 @@ import { beforeEach, describe, expect, it, vi } from "vitest"
 import type { TeamPlan } from "@/lib/api/billing-v2"
 
 const mocks = vi.hoisted(() => ({
+  capabilityUnavailable: false,
+  buyCredit: true,
+  recharge: true,
   version: vi.fn(),
   plan: vi.fn(),
   prepaid: vi.fn(),
@@ -59,6 +78,9 @@ function mount() {
 }
 
 beforeEach(() => {
+  mocks.capabilityUnavailable = false
+  mocks.buyCredit = true
+  mocks.recharge = true
   mocks.plan.mockReturnValue({ data: null })
   mocks.prepaid.mockReturnValue({ data: undefined })
   mocks.summary.mockReturnValue({
@@ -73,7 +95,7 @@ describe("PlanBanner with pricing v2 off", () => {
     expect(screen.getByTestId("legacy-banner")).toBeTruthy()
     expect(mocks.plan).toHaveBeenCalledWith(true)
     expect(mocks.prepaid).not.toHaveBeenCalled()
-    expect(mocks.returnNotice).not.toHaveBeenCalled()
+    expect(mocks.returnNotice).toHaveBeenCalled()
   })
 })
 
@@ -265,3 +287,37 @@ describe("PlanBanner with pricing v2 on", () => {
     expect(screen.getByText(/billing administrator/)).toBeTruthy()
   })
 })
+
+it("does not misreport an administrator's permissions when capabilities fail", () => {
+  mocks.capabilityUnavailable = true
+  mocks.plan.mockReturnValue({ data: plan("free") })
+  mount()
+  expect(
+    screen.queryByText(/Contact your team's billing administrator/),
+  ).toBeNull()
+  expect(screen.queryByRole("link", { name: "Upgrade" })).toBeNull()
+})
+it.each([
+  [false, true],
+  [true, false],
+])(
+  "gates Starter purchase=%s and recharge=%s independently",
+  (buy, recharge) => {
+    mocks.buyCredit = buy
+    mocks.recharge = recharge
+    mocks.plan.mockReturnValue({ data: plan("prepaid") })
+    mocks.prepaid.mockReturnValue({
+      data: { balance_cents: 250, auto_recharge: { enabled: false } },
+    })
+    mount()
+    expect(Boolean(screen.queryByRole("link", { name: "Buy credit" }))).toBe(
+      buy,
+    )
+    expect(
+      Boolean(screen.queryByRole("link", { name: "Set up auto-recharge" })),
+    ).toBe(recharge)
+    expect(
+      screen.queryByText(/Contact your team's billing administrator/),
+    ).toBeNull()
+  },
+)

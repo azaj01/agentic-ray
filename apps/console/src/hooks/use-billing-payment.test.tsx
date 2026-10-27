@@ -1,3 +1,10 @@
+vi.mock("@/hooks/use-billing-capabilities", () => ({
+  useBillingCapabilities: () => ({
+    data: mocks.capabilityModel
+      ? { pricing_version: mocks.capabilityModel }
+      : undefined,
+  }),
+}))
 vi.mock("@/hooks/use-user", () => ({
   useUser: () => ({ user: { id: "u1" }, loading: false }),
 }))
@@ -11,6 +18,7 @@ import { teamKeys } from "@/lib/api/query-keys"
 import { useBillingPayment } from "./use-billing-payment"
 
 const mocks = vi.hoisted(() => ({
+  capabilityModel: "legacy" as "legacy" | "v2" | undefined,
   checkout: vi.fn(),
   portal: vi.fn(),
   publishEvidence: vi.fn(),
@@ -49,6 +57,7 @@ function setup(value = summary) {
   return { ...hook, client }
 }
 beforeEach(() => {
+  mocks.capabilityModel = "legacy"
   sessionStorage.clear()
   vi.clearAllMocks()
   mocks.scope.mockReturnValue("self")
@@ -73,8 +82,12 @@ it("keeps checkout return conventions and blocks duplicate submission", async ()
   expect(result.current.submitting).toBe("checkout")
   expect(mocks.checkout).toHaveBeenCalledTimes(1)
   const params = mocks.checkout.mock.calls[0][0]
-  expect(new URL(params.successUrl).searchParams.get("billing")).toBe("success")
-  expect(new URL(params.cancelUrl).searchParams.get("billing")).toBe("cancel")
+  expect(new URL(params.successUrl).searchParams.get("billing_flow")).toBe(
+    "success",
+  )
+  expect(new URL(params.cancelUrl).searchParams.get("billing_flow")).toBe(
+    "cancel",
+  )
   expect(new URL(params.successUrl).searchParams.get("tab")).toBe("one")
   await act(async () => {
     reject(new Error("Unavailable"))
@@ -91,7 +104,7 @@ it("prefers the existing portal flow", async () => {
   expect(mocks.checkout).not.toHaveBeenCalled()
   expect(
     new URL(mocks.portal.mock.calls[0][0].returnUrl).searchParams.get(
-      "billing",
+      "billing_flow",
     ),
   ).toBe("portal-return")
 })
@@ -216,4 +229,54 @@ it("ignores a late payment response after team selection changes", async () => {
   })
   expect(window.location.href).toBe(originalUrl)
   expect(mocks.toast).not.toHaveBeenCalled()
+})
+
+it.each([false, true])(
+  "keeps existing purchase and Pro callback identity separate from generic setup (portal: %s)",
+  async (portal) => {
+    window.history.replaceState(
+      {},
+      "",
+      "/billing/pro/?billing=success&team=use%3A11111111-1111-4111-8111-111111111111&purchase_id=22222222-2222-4222-8222-222222222222",
+    )
+    const request = portal ? mocks.portal : mocks.checkout
+    request.mockRejectedValue(new Error("not navigating"))
+    const { result } = setup({ ...summary, portal_available: portal })
+    await act(() => result.current.openSession())
+    const raw = request.mock.calls[0][0]
+    const urls = portal ? [raw.returnUrl] : [raw.successUrl, raw.cancelUrl]
+    for (const value of urls) {
+      const url = new URL(value)
+      expect(url.searchParams.get("billing")).toBe("success")
+      expect(url.searchParams.get("team")).toBe(
+        "use:11111111-1111-4111-8111-111111111111",
+      )
+      expect(url.searchParams.get("purchase_id")).toBe(
+        "22222222-2222-4222-8222-222222222222",
+      )
+      expect(url.searchParams.has("billing_flow")).toBe(true)
+    }
+  },
+)
+
+it("never falls back to legacy card checkout after enrolled capabilities become unavailable", async () => {
+  mocks.capabilityModel = "v2"
+  const { result, rerender } = setup()
+  expect(result.current.available).toBe(false)
+  mocks.capabilityModel = undefined
+  rerender({ teamKey: "use:a" })
+  await act(() => result.current.openSession())
+  expect(result.current.available).toBe(false)
+  expect(mocks.checkout).not.toHaveBeenCalled()
+  rerender({ teamKey: "use:other" })
+  await act(() => result.current.openSession())
+  expect(mocks.checkout).not.toHaveBeenCalled()
+})
+it("preserves the existing customer portal when capabilities are unavailable", async () => {
+  mocks.capabilityModel = undefined
+  mocks.portal.mockRejectedValue(new Error("Portal unavailable"))
+  const { result } = setup({ ...summary, portal_available: true })
+  await act(() => result.current.openSession())
+  expect(mocks.portal).toHaveBeenCalledTimes(1)
+  expect(mocks.checkout).not.toHaveBeenCalled()
 })

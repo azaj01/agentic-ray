@@ -113,6 +113,23 @@ describe("api proxy /api/[...path]", () => {
     vi.mocked(getImpersonationContext).mockResolvedValue(null)
   })
 
+  it("forwards team capabilities only through authenticated billing reads", async () => {
+    fetchSpy.mockResolvedValue(
+      new Response(JSON.stringify({ schema_version: 1 }), { status: 200 }),
+    )
+    const path = ["billing", "capabilities"]
+    const response = await GET(req("GET", path), params(path))
+    expect(response.status).toBe(200)
+    expect(String(fetchSpy.mock.calls[0][0])).toContain("/billing/capabilities")
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: { getUser: async () => ({ data: { user: null } }) },
+    } as never)
+    fetchSpy.mockClear()
+    const denied = await GET(req("GET", path), params(path))
+    expect(denied.status).toBe(401)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+
   it("returns 404 for a path outside the allowed prefixes", async () => {
     const res = await GET(req("GET", ["unknown"]), params(["unknown"]))
     expect(res.status).toBe(404)
@@ -1339,6 +1356,7 @@ describe("api proxy prepaid credit", () => {
 
   it.each([
     ["billing/prepaid/checkout", "POST"],
+    ["billing/prepaid/checkout/recover", "POST"],
     ["billing/prepaid/auto-recharge", "PUT"],
   ])("rejects a stale team's %s request before dispatch", async (p, method) => {
     const path = p.split("/")
@@ -1357,6 +1375,8 @@ describe("api proxy prepaid credit", () => {
     for (const [p, method, handler] of [
       ["billing/prepaid", "POST", POST],
       ["billing/prepaid/checkout", "GET", GET],
+      ["billing/prepaid/checkout/recover", "GET", GET],
+      ["billing/prepaid/checkout/recover", "PUT", PUT],
       ["billing/prepaid/auto-recharge", "POST", POST],
       ["billing/prepaid/auto-recharge", "DELETE", DELETE],
     ] as const) {
@@ -1384,5 +1404,87 @@ describe("api proxy prepaid credit", () => {
     )
     expect(res.status).toBe(403)
     expect(fetchSpy).not.toHaveBeenCalled()
+  })
+})
+
+describe("pending Starter checkout proxy", () => {
+  beforeEach(() => {
+    fetchSpy.mockReset()
+    vi.mocked(createServerClient).mockResolvedValue({
+      auth: { getUser: async () => ({ data: { user: { id: "user-1" } } }) },
+    } as never)
+    vi.mocked(getImpersonationContext).mockResolvedValue(null)
+    vi.mocked(getAuthApiKeyAndTeamForUser).mockResolvedValue({
+      apiKey: "server-owned-key",
+      team: { teamId: "team-east", region: "use" },
+    })
+  })
+  it("forwards only the bounded recovery fields with server auth", async () => {
+    fetchSpy.mockResolvedValue(
+      new Response(
+        JSON.stringify({ outcome: "payment_confirmation_pending" }),
+        { status: 202 },
+      ),
+    )
+    const path = ["billing", "prepaid", "checkout", "recover"]
+    const response = await POST(
+      req("POST", path, {
+        body: JSON.stringify({
+          expected_team: "use:team-east",
+          purchase_id: "33333333-3333-4333-8333-333333333333",
+          checkout_generation: "2026-10-26T12:00:00.123456789Z",
+          cancel: true,
+          amount_cents: 999999,
+          customer: "untrusted",
+          url: "https://external.test",
+        }),
+      }),
+      params(path),
+    )
+    expect(response.status).toBe(202)
+    const [url, init] = fetchSpy.mock.calls[0]
+    expect(url).toBe(
+      "https://api.test.superserve.ai/billing/prepaid/checkout/recover",
+    )
+    expect(JSON.parse(init.body)).toEqual({
+      purchase_id: "33333333-3333-4333-8333-333333333333",
+      checkout_generation: "2026-10-26T12:00:00.123456789Z",
+      cancel: true,
+    })
+    expect(init.headers.get("X-API-Key")).toBeTruthy()
+    expect(response.headers.get("cache-control")).toBe("private, no-store")
+  })
+  it("does not permit discovery or cancellation during impersonation", async () => {
+    vi.mocked(getImpersonationContext).mockResolvedValue({
+      teamId: "team-west",
+      region: "usw",
+    } as never)
+    const path = ["billing", "prepaid", "checkout", "recover"]
+    const response = await POST(
+      req("POST", path, {
+        body: JSON.stringify({ expected_team: "usw:team-west" }),
+      }),
+      params(path),
+    )
+    expect(response.status).toBe(403)
+    expect(fetchSpy).not.toHaveBeenCalled()
+  })
+  it("preserves backend permission denial instead of treating it as no pending purchase", async () => {
+    fetchSpy.mockResolvedValue(
+      new Response(JSON.stringify({ error: { code: "permission_denied" } }), {
+        status: 403,
+      }),
+    )
+    const path = ["billing", "prepaid", "checkout", "recover"]
+    const response = await POST(
+      req("POST", path, {
+        body: JSON.stringify({ expected_team: "use:team-east" }),
+      }),
+      params(path),
+    )
+    expect(response.status).toBe(403)
+    expect(await response.json()).toEqual({
+      error: { code: "permission_denied" },
+    })
   })
 })

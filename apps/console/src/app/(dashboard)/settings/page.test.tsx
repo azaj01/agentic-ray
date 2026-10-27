@@ -1,3 +1,17 @@
+vi.mock("@/hooks/use-billing-capabilities", () => ({
+  useBillingCapabilities: () => ({
+    data: {
+      pricing_version: "legacy",
+      entry_open: false,
+      fresh_entry: {
+        starter: false,
+        pro: false,
+        auto_recharge: false,
+        choose_free: false,
+      },
+    },
+  }),
+}))
 import { render, screen } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
@@ -22,6 +36,13 @@ vi.mock("@/hooks/use-billing-summary", () => ({
 
 vi.mock("@/hooks/use-billing-usage", () => ({
   useBillingSettings: (...args: unknown[]) => useBillingSettings(...args),
+}))
+
+vi.mock("@/hooks/use-billing-v2", () => ({
+  useTeamPlan: () => ({ data: undefined, isError: false }),
+  useFreeAllowance: () => ({ data: undefined }),
+  useAllowancePricing: () => ({ data: undefined }),
+  usePrepaidBalance: () => ({ data: undefined }),
 }))
 
 vi.mock("@/components/settings/teams-section", () => ({
@@ -228,7 +249,7 @@ describe("Settings billing", () => {
       error: null,
     })
     renderPage()
-    expect(screen.getByText("Usage-based billing")).toBeInTheDocument()
+    expect(screen.getByText("Resource rates")).toBeInTheDocument()
     expect(screen.getByText("Tracking")).toBeInTheDocument()
     expect(screen.getByText("Billed")).toBeInTheDocument()
   })
@@ -279,7 +300,7 @@ describe("Settings billing", () => {
       error: new Error("unavailable"),
     })
     const view = renderPage()
-    expect(view.queryByText("Usage-based billing")).not.toBeInTheDocument()
+    expect(view.queryByText("Resource rates")).not.toBeInTheDocument()
 
     useBillingSummary.mockReturnValue({
       data: {
@@ -290,7 +311,7 @@ describe("Settings billing", () => {
       error: null,
     })
     view.rerender(<SettingsPage />)
-    expect(view.queryByText("Usage-based billing")).not.toBeInTheDocument()
+    expect(view.queryByText("Resource rates")).not.toBeInTheDocument()
   })
 
   it("does not render retained summary data after an authenticated refresh fails", () => {
@@ -302,7 +323,7 @@ describe("Settings billing", () => {
 
     const view = renderPage()
 
-    expect(view.queryByText("Usage-based billing")).not.toBeInTheDocument()
+    expect(view.queryByText("Resource rates")).not.toBeInTheDocument()
     expect(view.queryByText("Billed")).not.toBeInTheDocument()
   })
 

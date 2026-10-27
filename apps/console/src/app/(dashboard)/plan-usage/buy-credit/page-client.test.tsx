@@ -1,7 +1,21 @@
+vi.mock("@/hooks/use-billing-capabilities", () => ({
+  useBillingCapabilities: () => ({
+    data: {
+      fresh_entry: {
+        starter: vi.mocked(usePricingVersion)() === "v2",
+        auto_recharge: vi.mocked(usePricingVersion)() === "v2",
+      },
+    },
+  }),
+}))
 import { render, screen } from "@testing-library/react"
 import { beforeEach, describe, expect, it, vi } from "vitest"
 
 import { dollarsToCents, formatDollars, requestedAmount } from "./page-client"
+
+vi.mock("next/navigation", () => ({
+  useSearchParams: () => new URLSearchParams(),
+}))
 
 vi.mock("@/hooks/use-pricing-version", () => ({
   usePricingVersion: vi.fn(),
@@ -48,6 +62,11 @@ describe("buy credit amounts", () => {
     expect(requestedAmount("5000")).toEqual({ preset: 5000, custom: "" })
     expect(requestedAmount("7500")).toEqual({ preset: 2500, custom: "75" })
     expect(requestedAmount("750")).toEqual({ preset: 2500, custom: "" })
+    expect(requestedAmount("1000000")).toEqual({
+      preset: 2500,
+      custom: "10000",
+    })
+    expect(requestedAmount("1000500")).toEqual({ preset: 2500, custom: "" })
     expect(requestedAmount(null)).toEqual({ preset: 2500, custom: "" })
   })
 
