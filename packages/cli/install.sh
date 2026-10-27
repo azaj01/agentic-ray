@@ -133,13 +133,21 @@ if [ -z "$ON_PATH" ] && [ -z "$UPDATED" ]; then
   echo "  $LINE"
 fi
 
+# An older install earlier on PATH (e.g. the 1.x npm package) would keep
+# answering to plain `superserve`.
+OTHER="$(command -v superserve 2>/dev/null || true)"
+if [ -n "$OTHER" ] && [ "$OTHER" != "${INSTALL_DIR}/superserve" ]; then
+  echo ""
+  info "Note: another superserve at ${OTHER} comes first on your PATH. Remove it (for example 'npm uninstall -g @superserve/cli') so 'superserve' runs this one."
+fi
+
 # --- Sign in ---
 # A person at a terminal goes straight to the browser login, which also signs
 # new users up. Under `curl | sh` stdin is this script, so login reads the tty.
 # whoami is a network call, so it only runs when login would.
 SUPERSERVE="${INSTALL_DIR}/superserve"
 if [ -n "${SUPERSERVE_NO_LOGIN:-}" ] || [ ! -t 1 ] || ! (: </dev/tty) 2>/dev/null; then
-  info "Done! Run 'superserve login' to sign in."
+  info "Done! Run 'superserve login' to sign in (agents and scripts: 'superserve login --no-wait')."
 elif "$SUPERSERVE" whoami >/dev/null 2>&1; then
   info "Done! You're already signed in."
 else
