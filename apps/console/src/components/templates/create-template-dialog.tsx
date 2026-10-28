@@ -14,7 +14,7 @@ import {
 } from "@superserve/ui"
 import Link from "next/link"
 import { useRouter } from "next/navigation"
-import { useMemo, useState } from "react"
+import { useEffect, useMemo, useState } from "react"
 
 import { useTemplateEntitlement } from "@/hooks/use-template-entitlement"
 import { useCreateTemplate } from "@/hooks/use-templates"
@@ -29,13 +29,20 @@ const CURATED_IMAGES = [
   "debian:12-slim",
 ] as const
 
-// Trimmed to the default per-team caps from the backend (vcpu=2, memory_mib=2048,
+// Trimmed to the default per-team caps from the backend (vcpu=2, memory_mib=4096,
 // disk_mib=8192). Teams with raised caps drop to the SDK/API for higher values.
-const MEMORY_OPTIONS = [256, 512, 1024, 2048] as const
+const MEMORY_OPTIONS = [256, 512, 1024, 2048, 4096] as const
 const DISK_OPTIONS = [1024, 2048, 4096, 8192] as const
 const VCPU_OPTIONS = [1, 2] as const
 
 const NAME_RE = /^[a-z0-9][a-z0-9-]*$/
+
+function withinCap(
+  options: readonly number[],
+  cap: number | null | undefined,
+): readonly number[] {
+  return cap == null ? options : options.filter((option) => option <= cap)
+}
 
 function validateName(name: string): string | null {
   if (!name) return "Name is required"
@@ -69,6 +76,12 @@ export function CreateTemplateDialog({
   const create = useCreateTemplate()
   const entitlement = useTemplateEntitlement()
   const templatesUnavailable = entitlement.status === "unavailable"
+  // Offer only shapes within the team's plan caps; a missing cap keeps the
+  // full list. Teams with raised caps use the SDK/API for higher values.
+  const caps = entitlement.limits
+  const memoryOptions = withinCap(MEMORY_OPTIONS, caps?.max_memory_mib)
+  const vcpuOptions = withinCap(VCPU_OPTIONS, caps?.max_vcpu)
+  const diskOptions = withinCap(DISK_OPTIONS, caps?.max_disk_mib)
 
   const [internalOpen, setInternalOpen] = useState(false)
   const open = controlledOpen ?? internalOpen
@@ -86,6 +99,16 @@ export function CreateTemplateDialog({
     image?: string
     form?: string
   }>({})
+  // A cap can shrink after a selection (plan refresh, team switch); keep the
+  // selection on an offered shape so the submit matches what is shown.
+  useEffect(() => {
+    if (!memoryOptions.includes(memory))
+      setMemory(memoryOptions[memoryOptions.length - 1] ?? MEMORY_OPTIONS[0])
+    if (!vcpuOptions.includes(vcpu))
+      setVcpu(vcpuOptions[vcpuOptions.length - 1] ?? VCPU_OPTIONS[0])
+    if (!diskOptions.includes(disk))
+      setDisk(diskOptions[diskOptions.length - 1] ?? DISK_OPTIONS[0])
+  }, [memoryOptions, vcpuOptions, diskOptions, memory, vcpu, disk])
 
   const reset = () => {
     setName("")
@@ -276,7 +299,7 @@ export function CreateTemplateDialog({
 
           <Field label="Memory">
             <div className="flex border border-dashed border-border">
-              {MEMORY_OPTIONS.map((m) => (
+              {memoryOptions.map((m) => (
                 <button
                   key={m}
                   type="button"
@@ -299,7 +322,7 @@ export function CreateTemplateDialog({
             <div className="grid grid-cols-2 gap-3">
               <Field label="vCPU">
                 <div className="flex border border-dashed border-border">
-                  {VCPU_OPTIONS.map((n) => (
+                  {vcpuOptions.map((n) => (
                     <button
                       key={n}
                       type="button"
@@ -319,7 +342,7 @@ export function CreateTemplateDialog({
 
               <Field label="Disk">
                 <div className="flex border border-dashed border-border">
-                  {DISK_OPTIONS.map((d) => (
+                  {diskOptions.map((d) => (
                     <button
                       key={d}
                       type="button"
